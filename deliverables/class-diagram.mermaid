@@ -1,0 +1,57 @@
+classDiagram
+    class Strategies {
+        +board_of(code) str
+        +is_limit_up(code, change_pct, th) bool
+        +DEFAULT_CONFIG dict
+        +run_prediction(df, cfg) dict
+        +run_tail_session(df, cfg) tuple
+    }
+    class Loader {
+        +clean(df) tuple
+        +load_dataset(base_dir) tuple
+    }
+    class Metrics {
+        +per_trade_cost_pct(code, bcfg) float
+        +net_return_curve(gross_ret, codes, bcfg) dict
+        +benchmark_curve(actual, bcfg) dict
+        +daily_ic_series(db, list_type, cfg) DataFrame
+        +factor_significance(daily_ic, alpha) DataFrame
+        +factor_correlation(db, cfg, method) DataFrame
+        +incremental_ic(db, list_type, cfg) DataFrame
+    }
+    class Backtest {
+        +backtest_one(db, target_date, list_type, cfg, caliber) tuple
+        +rolling_ic(db, list_type, cfg) tuple
+        +dynamic_weight_plan(db, cfg, roll, used) tuple
+        +make_advice(db, cfg) tuple
+    }
+    class Topdown {
+        +fetch_index(ak, symbol, lookback) DataFrame
+        +index_timing(close_s, symbol) dict
+        +breadth_timing(u) dict
+        +synthetic_timing(u, ak, cfg) dict
+        +topdown_rank(u, ak, ...) tuple
+    }
+    class DB {
+        +get_daily(date) DataFrame
+        +get_predictions(target_date) DataFrame
+        +pending_backtest_dates() list
+    }
+    class App {
+        +predict()
+        +run_backtest()
+        +_build_config_tab()
+    }
+
+    Loader ..> Strategies : 调用 is_limit_up
+    Strategies ..> Strategies : run_prediction 用 is_limit_up
+    Backtest ..> Metrics : 调用 净值/相关性/显著性
+    Backtest ..> DB : 读 predictions/daily
+    Metrics ..> DB : 读 daily/predictions
+    Topdown ..> Topdown : synthetic_timing 组合多指数
+    App ..> Strategies : run_prediction
+    App ..> Backtest : backtest_one/make_advice
+    App ..> Topdown : synthetic_timing(经 extensions)
+    App ..> DB : 只读
+    note for Strategies "新增唯一涨停判定入口"
+    note for Metrics "NEW 绩效+因子分析纯函数"

@@ -160,23 +160,32 @@ db.save_predictions('20260813', '20260814', '连板候选', res['连板候选'],
 db.save_predictions('20260813', '20260814', '尾盘选股', tail, '预估次日溢价概率%', '尾盘评分')
 check('pending_backtest_dates 含 20260814', '20260814' in db.pending_backtest_dates())
 
-print('== 8. 分清单回测评分 ==')
+print('== 8. 分清单回测评分（P0-2/3：含净收益/绩效 四元组） ==')
 for lt in bt.LIST_TYPES:
-    mg, summary, ic = bt.backtest_one(db, '20260814', lt, cfg)
+    mg, summary, ic, perf = bt.backtest_one(db, '20260814', lt, cfg)
     if summary is None:
         print(f'   {lt}: 样本不足')
         continue
-    print(f"   {lt}: 平均得分={summary['平均得分']} 总得分={summary['总得分']} 达成率={summary['达成率']}")
+    print(f"   {lt}: 平均得分={summary['平均得分']} 总得分={summary['总得分']} 达成率={summary['达成率']} 净组合收益={perf['net_return']:.4f}")
     check(f'{lt} 有得分列', mg is not None and '得分' in mg.columns)
+    check(f'{lt} perf 含 净收益/基准/无法成交比例/口径',
+          perf is not None and {'net_return', 'bench_return', 'cant_trade_ratio', 'caliber'} <= set(perf))
+    check(f'{lt} 明细含 净收益%/无法成交', mg is not None
+          and '净收益%' in mg.columns and '无法成交' in mg.columns)
 # 抽查：连板候选里 烂板C 次日 -6.5% → 触发 [-99,-100] 档（<-6 即-100）
-mg, _, _ = bt.backtest_one(db, '20260814', '连板候选', cfg)
+mg, _, _, _ = bt.backtest_one(db, '20260814', '连板候选', cfg)
 if mg is not None and '烂板C' in mg['name'].values:
     sc = mg[mg['name'] == '烂板C']['得分'].iloc[0]
     check('烂板C(-6.5%) 连板规则扣100分', sc == -100, f'got={sc}')
-mg2, _, _ = bt.backtest_one(db, '20260814', '涨停TopN', cfg)
+mg2, _, _, _ = bt.backtest_one(db, '20260814', '涨停TopN', cfg)
 if mg2 is not None and '强封B' in mg2['name'].values:
     sc = mg2[mg2['name'] == '强封B']['得分'].iloc[0]
     check('强封B(涨停) 涨停规则得100分', sc == 100, f'got={sc}')
+# 口径 close vs open：净收益应不同（open 用 开盘→收盘 跳空）
+mg_c, _, _, perf_c = bt.backtest_one(db, '20260814', '涨停TopN', cfg, caliber='close')
+mg_o, _, _, perf_o = bt.backtest_one(db, '20260814', '涨停TopN', cfg, caliber='open')
+check('口径参数生效(close/open 返回不同 caliber)',
+      perf_c is not None and perf_o is not None and perf_c['caliber'] != perf_o['caliber'])
 
 print('== 9. 滚动 + 调参建议 ==')
 roll, n = bt.rolling_ic(db, '涨停TopN', cfg)
@@ -194,4 +203,5 @@ fails = [n for n, c in ok if not c]
 print(f'== 结果：{len(ok) - len(fails)}/{len(ok)} 通过 ==' + (f' 失败: {fails}' if fails else ''))
 db.close()
 shutil.rmtree(TMP, ignore_errors=True)
-sys.exit(1 if fails else 0)
+if __name__ == '__main__':
+    sys.exit(1 if fails else 0)

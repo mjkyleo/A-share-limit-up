@@ -23,11 +23,12 @@ from datetime import datetime
 
 import pandas as pd
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
                                QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-                               QProgressDialog, QSpinBox, QTabWidget, QTableWidget,
-                               QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+                               QProgressDialog, QRadioButton, QSpinBox, QTabWidget,
+                               QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, 'data')     # 数据文件统一放这里（自动创建）
@@ -35,15 +36,30 @@ os.makedirs(DATA_DIR, exist_ok=True)
 sys.path.insert(0, BASE_DIR)
 
 from core import backtest as bt
+from core import metrics
 from core import calendar_cn as cal
 from core import loader, strategies
 from core.db import DB
 from extensions import REGISTRY, enabled_extensions, get_source
 
+# P0-4：research screen 显示层重命名（仅改显示，内部列名/入库字段不变）
+PROB_ALIASES = {
+    '预估涨停概率%': '排序分（非真实概率）',
+    '预估涨4概率%': '排序分（非真实概率）',
+    '预估次日溢价概率%': '排序分（非真实概率）',
+}
+RESEARCH_NOTE = ('⚠️ 研究屏幕：以上"排序分（非真实概率）"仅用于排序参考，'
+                 '非真实概率、非收益承诺。')
 
-def df_to_table(table, df, max_rows=200):
-    """DataFrame → QTableWidget"""
+
+def df_to_table(table, df, max_rows=200, aliases=None):
+    """DataFrame → QTableWidget。
+
+    aliases: 列名显示层重命名映射（P0-4：仅改显示，不动内部列名/入库字段）。
+    """
     df = df.head(max_rows)
+    if aliases:
+        df = df.rename(columns=aliases)
     table.setColumnCount(len(df.columns))
     table.setRowCount(len(df))
     table.setHorizontalHeaderLabels([str(c) for c in df.columns])
@@ -156,6 +172,10 @@ class MainWindow(QMainWindow):
         self.pred_tabs.addTab(self.tbl_monday, '跨日连板候选')
         lay.addWidget(self.lbl_pred_info)
         lay.addWidget(self.pred_tabs)
+        self.lbl_pred_foot = QLabel(RESEARCH_NOTE)
+        self.lbl_pred_foot.setWordWrap(True)
+        self.lbl_pred_foot.setStyleSheet('color:#b8860b;font-size:11px')
+        lay.addWidget(self.lbl_pred_foot)
         return w
 
     def _build_tail_tab(self):
@@ -168,6 +188,10 @@ class MainWindow(QMainWindow):
         self.tbl_tail = QTableWidget()
         lay.addWidget(self.lbl_tail_info)
         lay.addWidget(self.tbl_tail)
+        self.lbl_tail_foot = QLabel(RESEARCH_NOTE)
+        self.lbl_tail_foot.setWordWrap(True)
+        self.lbl_tail_foot.setStyleSheet('color:#b8860b;font-size:11px')
+        lay.addWidget(self.lbl_tail_foot)
         return w
 
     def _build_backtest_tab(self):
@@ -181,6 +205,12 @@ class MainWindow(QMainWindow):
         self.cmb_list = QComboBox()
         self.cmb_list.addItems(bt.LIST_TYPES)
         row.addWidget(self.cmb_list)
+        row.addWidget(QLabel('收益口径:'))
+        self.radio_close = QRadioButton('close(T日收→T+1收)')
+        self.radio_open = QRadioButton('open(T+1开→T+1收)')
+        self.radio_close.setChecked(True)
+        row.addWidget(self.radio_close)
+        row.addWidget(self.radio_open)
         self.lbl_bt_summary = QLabel('—')
         row.addWidget(self.lbl_bt_summary, 1)
         lay.addLayout(row)
@@ -189,23 +219,30 @@ class MainWindow(QMainWindow):
         self.tbl_bt_ic = QTableWidget()
         self.tbl_bt_rolling = QTableWidget()
         self.tbl_bt_score = QTableWidget()
+        self.tbl_bt_perf = QTableWidget()
+        self.tbl_bt_corr = QTableWidget()
+        self.tbl_bt_incic = QTableWidget()
         self.bt_tabs.addTab(self.tbl_bt_detail, '单日明细')
         self.bt_tabs.addTab(self.tbl_bt_ic, '单策略IC(当日)')
         self.bt_tabs.addTab(self.tbl_bt_rolling, '策略IC滚动汇总')
         self.bt_tabs.addTab(self.tbl_bt_score, '清单得分滚动')
+        self.bt_tabs.addTab(self.tbl_bt_perf, '净值/绩效')
+        self.bt_tabs.addTab(self.tbl_bt_corr, '因子相关性')
+        self.bt_tabs.addTab(self.tbl_bt_incic, '增量IC')
         advice_w = QWidget()
         al = QVBoxLayout(advice_w)
         # 动态权重开关
         dw_cfg = self.cfg.get('dynamic_weights', {})
-        self.chk_auto_kill = QCheckBox('负IC因子自动归零（0%，硬kill反向因子）')
-        self.chk_auto_kill.setChecked(bool(dw_cfg.get('auto_kill_negative', True)))
-        self.chk_auto_kill.stateChanged.connect(
+        self.chk_sig_only = QCheckBox('仅对显著因子调权（Bonferroni 多重比较校正）')
+        self.chk_sig_only.setChecked(bool(dw_cfg.get('auto_kill_negative', True)))
+        self.chk_sig_only.setToolTip('取消勾选则全部因子按 EMA_IC 加权；勾选则不显著因子收缩至地板（不再归零）')
+        self.chk_sig_only.stateChanged.connect(
             lambda s: self._set_dw('auto_kill_negative', s == 2))
         self.chk_auto_apply = QCheckBox('回测时自动应用动态权重（写入配置并刷新参数页）')
         self.chk_auto_apply.setChecked(bool(dw_cfg.get('auto_apply', False)))
         self.chk_auto_apply.stateChanged.connect(
             lambda s: self._set_dw('auto_apply', s == 2))
-        al.addWidget(self.chk_auto_kill)
+        al.addWidget(self.chk_sig_only)
         al.addWidget(self.chk_auto_apply)
         self.btn_apply_w = QPushButton('✅ 一键应用建议权重（覆盖当前五策略权重并保存）')
         self.btn_apply_w.clicked.connect(self.apply_suggested_weights)
@@ -213,11 +250,18 @@ class MainWindow(QMainWindow):
         self.txt_advice = QTextEdit()
         self.txt_advice.setReadOnly(True)
         al.addWidget(self.txt_advice)
-        al.addWidget(QLabel('动态权重计划（基于滚动IC，自动归零负IC因子）：'))
+        al.addWidget(QLabel('动态权重计划（shrinkage：EMA平滑+显著性+λ收缩，不再归零）：'))
         self.tbl_dyn_w = QTableWidget()
         al.addWidget(self.tbl_dyn_w)
         self.bt_tabs.addTab(advice_w, '💡 调参建议')
         lay.addWidget(self.bt_tabs)
+        self.lbl_bt_foot = QLabel(
+            '⚠️ 研究屏幕：回测为历史对照参考，非收益承诺。'
+            '单日(n=1)无法计算 Sharpe/最大回撤，将在"净值/绩效"页标注"样本不足"；'
+            '净值曲线等权、每日再平衡、初始100万仅作刻度。')
+        self.lbl_bt_foot.setWordWrap(True)
+        self.lbl_bt_foot.setStyleSheet('color:#b8860b;font-size:11px')
+        lay.addWidget(self.lbl_bt_foot)
         self._suggested_weights = None
         return w
 
@@ -227,6 +271,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(QLabel('策略权重（保存后立即生效，自动归一化）：'))
         self.tbl_weights = QTableWidget()
         lay.addWidget(self.tbl_weights)
+        # P0-1：待验证标签（权重/历史表现均基于有限样本，仅研究参考）
+        lbl_verify = QLabel('⚠️ 待验证（回测样本有限）：本工具权重与历史表现均基于有限样本，'
+                            '仅作研究参考、非收益承诺、请勿直接用于实盘决策。')
+        lbl_verify.setWordWrap(True)
+        lbl_verify.setStyleSheet('color:#b8860b;font-size:11px')
+        lay.addWidget(lbl_verify)
         lay.addWidget(QLabel('关键阈值与参数：'))
         self.form = QFormLayout()
         self.spin = {}
@@ -257,6 +307,53 @@ class MainWindow(QMainWindow):
             self.spin[key] = sp
             self.form.addRow(label, sp)
         lay.addLayout(self.form)
+
+        # T9（P0-1）：回测成本与口径 / 动态权重（新增可编辑，向后兼容）
+        self.cfg_widgets = {}
+        bcfg = self.cfg.get('backtest_cost', {})
+        dw = self.cfg.get('dynamic_weights', {})
+
+        def add_spin(parent, key, label, val, lo, hi, step, dec):
+            sp = QDoubleSpinBox()
+            sp.setRange(lo, hi)
+            sp.setSingleStep(step)
+            sp.setDecimals(dec)
+            sp.setValue(val)
+            parent.addRow(label, sp)
+            self.cfg_widgets[key] = sp
+
+        gb_bc = QGroupBox('回测成本与口径 (backtest_cost)')
+        bc_lay = QFormLayout(gb_bc)
+        add_spin(bc_lay, 'bc_commission', '佣金(单边)', float(bcfg.get('commission', 0.00025)), 0, 0.01, 0.00005, 5)
+        add_spin(bc_lay, 'bc_stamp_tax', '印花税(卖出)', float(bcfg.get('stamp_tax', 0.001)), 0, 0.01, 0.0005, 5)
+        add_spin(bc_lay, 'bc_slippage_main', '滑点(主板单边)', float(bcfg.get('slippage_main', 0.001)), 0, 0.02, 0.0005, 5)
+        add_spin(bc_lay, 'bc_slippage_20cm', '滑点(20cm单边)', float(bcfg.get('slippage_20cm', 0.002)), 0, 0.02, 0.0005, 5)
+        cb_cal = QComboBox()
+        cb_cal.addItems(['close', 'open'])
+        cb_cal.setCurrentText(str(bcfg.get('caliber', 'close')))
+        bc_lay.addRow('收益口径(caliber)', cb_cal)
+        self.cfg_widgets['bc_caliber'] = cb_cal
+        chk_csv = QCheckBox('导出回测CSV报告到 reports/')
+        chk_csv.setChecked(bool(bcfg.get('report_csv', False)))
+        bc_lay.addRow('', chk_csv)
+        self.cfg_widgets['bc_report_csv'] = chk_csv
+        lay.addWidget(gb_bc)
+
+        gb_dw = QGroupBox('动态权重 (dynamic_weights · shrinkage 收缩，不再归零)')
+        dw_lay = QFormLayout(gb_dw)
+        add_spin(dw_lay, 'dw_ema_window', 'EMA窗口', float(dw.get('ema_window', 10)), 1, 60, 1, 0)
+        add_spin(dw_lay, 'dw_shrinkage_lambda', '收缩系数λ', float(dw.get('shrinkage_lambda', 0.3)), 0, 1, 0.05, 2)
+        add_spin(dw_lay, 'dw_significance_alpha', '显著性α(Bonferroni)', float(dw.get('significance_alpha', 0.05)), 0.001, 0.5, 0.005, 3)
+        chk_sig = QCheckBox('仅对显著因子调权(Bonferroni 多重比较校正)')
+        chk_sig.setChecked(bool(dw.get('auto_kill_negative', True)))
+        dw_lay.addRow('', chk_sig)
+        self.cfg_widgets['dw_auto_kill_negative'] = chk_sig
+        chk_dw_en = QCheckBox('启用动态权重')
+        chk_dw_en.setChecked(bool(dw.get('enabled', True)))
+        dw_lay.addRow('', chk_dw_en)
+        self.cfg_widgets['dw_enabled'] = chk_dw_en
+        lay.addWidget(gb_dw)
+
         row = QHBoxLayout()
         b1 = QPushButton('💾 保存参数')
         b1.clicked.connect(self.save_cfg)
@@ -478,13 +575,15 @@ class MainWindow(QMainWindow):
                     'S3锁仓度', 'S4资金', 'S5股性结构', 'M可买性', 'R风险系数',
                     '预估涨停概率%', '综合分']
             cols = [c for c in cols if c in data.columns or c in self.result['涨停TopN'].columns]
-            df_to_table(self.tbl_limit, self.result['涨停TopN'][cols])
+            df_to_table(self.tbl_limit, self.result['涨停TopN'][cols], aliases=PROB_ALIASES)
             r4cols = ['排名', '代码', '名称', '涨幅', '量比', '资金流向', '涨4评分', '预估涨4概率%']
             df_to_table(self.tbl_rise4,
-                        self.result['涨幅4%'][[c for c in r4cols if c in self.result['涨幅4%'].columns]])
+                        self.result['涨幅4%'][[c for c in r4cols if c in self.result['涨幅4%'].columns]],
+                        aliases=PROB_ALIASES)
             mcols = cols + ['连板潜力']
             df_to_table(self.tbl_monday,
-                        self.result['连板候选'][[c for c in mcols if c in self.result['连板候选'].columns]])
+                        self.result['连板候选'][[c for c in mcols if c in self.result['连板候选'].columns]],
+                        aliases=PROB_ALIASES)
 
             cv = strategies.cross_validate(self.result['全量'])
             cv_txt = ' | '.join(f'{k}: ρ={v[0]}' for k, v in cv.items()) if cv else '样本不足'
@@ -526,7 +625,8 @@ class MainWindow(QMainWindow):
             cols = ['排名', '代码', '名称', '类型', '涨幅', '量比', '换手', '封流比',
                     '主力净量', '强势', '资金', '量能', '位置',
                     '尾盘评分', 'M可买性', 'R风险系数', '预估次日溢价概率%']
-            df_to_table(self.tbl_tail, res[[c for c in cols if c in res.columns]])
+            df_to_table(self.tbl_tail, res[[c for c in cols if c in res.columns]],
+                        aliases=PROB_ALIASES)
             _, desc = cal.current_session()
             self.lbl_tail_info.setText(
                 f"📄 {info['文件']}（第{info.get('batch') or '?'}批，{len(data)}只）→ "
@@ -547,15 +647,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, '提示', '没有可回测的日期。\n回测需要：先有预测记录，再导入目标日收盘数据。')
                 return
             lt = self.cmb_list.currentText()
-            mg, summary, ic = bt.backtest_one(self.db, d, lt, self.cfg)
+            caliber = 'open' if self.radio_open.isChecked() else 'close'
+            mg, summary, ic, perf = bt.backtest_one(self.db, d, lt, self.cfg, caliber=caliber)
             if summary is None:
                 self.lbl_bt_summary.setText('该清单在此日匹配样本不足')
                 return
             self.lbl_bt_summary.setText(' | '.join(f'{k}:{v}' for k, v in summary.items()))
             if mg is not None:
-                df_to_table(self.tbl_bt_detail,
-                            mg[[c for c in ['rank', 'code', 'name', 'prob', '实际涨幅%', '实际涨停', '得分']
-                                if c in mg.columns]])
+                detail_cols = [c for c in ['rank', 'code', 'name', 'prob', '实际涨幅%', '实际涨停',
+                                           '得分', '口径收益%', '净收益%', '双边成本%', '无法成交']
+                               if c in mg.columns]
+                df_to_table(self.tbl_bt_detail, mg[detail_cols])
             if ic:
                 df_to_table(self.tbl_bt_ic, pd.DataFrame(ic).T.reset_index().rename(
                     columns={'index': '策略'}))
@@ -565,6 +667,11 @@ class MainWindow(QMainWindow):
             sc, _ = bt.rolling_score(self.db, lt, self.cfg)
             if not sc.empty:
                 df_to_table(self.tbl_bt_score, sc)
+            # ---- 净值/绩效（P0-2/P0-3）----
+            curve = metrics.rolling_net_curve(self.db, lt, self.cfg, caliber=caliber)
+            self._render_perf(lt, caliber, perf, curve)
+            # ---- 因子相关性 + 增量IC（P0-6）----
+            self._render_factor_analysis()
             advice, sug, plan = bt.make_advice(self.db, self.cfg)
             self.txt_advice.setPlainText('\n'.join(advice))
             self._suggested_weights = sug
@@ -578,10 +685,136 @@ class MainWindow(QMainWindow):
                 strategies.save_config(BASE_DIR, self.cfg)
                 self._load_weights_table()
                 self.log(f'已自动应用动态权重：{sug}')
-            self.log(f'回测完成：{d} / {lt}，累计可回测 {n_days} 天，调参建议已更新')
+            # ---- CSV 落盘（T10，受 backtest_cost.report_csv 控制）----
+            self._export_backtest_csv(d, lt, caliber, mg, summary, ic, perf, roll, n_days, curve)
+            self.log(f'回测完成：{d} / {lt}（{caliber}），累计可回测 {n_days} 天，调参建议已更新')
             self.tabs.setCurrentWidget(self.tab_bt)
         except Exception:
             self.log('回测出错:\n' + traceback.format_exc())
+
+    def _render_perf(self, list_type, caliber, perf, curve):
+        """渲染净值/绩效 Tab（P0-2/P0-3）：净组合收益/Sharpe/最大回撤/胜率/基准对照/无法成交/双边成本。"""
+        if perf is None:
+            self.tbl_bt_perf.setRowCount(0)
+            return
+        rows = [
+            ('口径', perf.get('caliber', caliber)),
+            ('样本n', perf.get('n', 0)),
+            ('可成交数', perf.get('n_tradable', 0)),
+            ('净组合收益%', f"{perf.get('net_return', 0.0) * 100:.2f}%"),
+            ('毛组合收益%', f"{perf.get('gross_return', 0.0) * 100:.2f}%"),
+            ('基准净收益%', f"{perf.get('bench_return', 0.0) * 100:.2f}%"),
+            ('基准毛收益%', f"{perf.get('bench_gross', 0.0) * 100:.2f}%"),
+            ('双边成本%', f"{perf.get('cost_pct', 0.0) * 100:.3f}%"),
+            ('无法成交比例', f"{perf.get('cant_trade_ratio', 0.0):.0%}"),
+            ('本日胜率', f"{perf.get('win_rate', 0.0):.0%}"),
+        ]
+        port = (curve or {}).get('portfolio', {})
+        if (curve or {}).get('sufficient'):
+            rows += [
+                ('累计净收益%(跨日)', f"{port.get('net_return', 0.0) * 100:.2f}%"),
+                ('年化Sharpe(跨日)', '样本不足' if pd.isna(port.get('sharpe', float('nan'))) else f"{port.get('sharpe', 0.0):.2f}"),
+                ('最大回撤(跨日)', f"{port.get('max_dd', 0.0) * 100:.2f}%"),
+                ('跨日胜率', f"{port.get('win_rate', 0.0):.0%}"),
+                ('可回测交易日', (curve or {}).get('n_days', 0)),
+            ]
+        else:
+            rows.append(('跨日净值', (curve or {}).get('note', '样本不足（需 ≥2 个交易日）')))
+        df_to_table(self.tbl_bt_perf, pd.DataFrame(rows, columns=['指标', '数值']))
+
+    def _render_factor_analysis(self):
+        """渲染因子相关性(彩色热力图) + 增量IC 两个 Tab（P0-6）。"""
+        corr = metrics.factor_correlation(self.db, self.cfg, method='spearman')
+        self._render_corr_table(corr)
+        inc = metrics.incremental_ic(self.db, '涨停TopN', self.cfg)
+        df_to_table(self.tbl_bt_incic, inc)
+
+    def _render_corr_table(self, corr: pd.DataFrame):
+        """因子相关性彩色热力图：正相关红(共线风险)/负相关蓝(对冲)/接近0白。"""
+        self.tbl_bt_corr.setColumnCount(0)
+        self.tbl_bt_corr.setRowCount(0)
+        if corr is None or corr.empty:
+            return
+        factors = list(corr.columns)
+        self.tbl_bt_corr.setColumnCount(len(factors) + 1)
+        self.tbl_bt_corr.setRowCount(len(factors))
+        self.tbl_bt_corr.setHorizontalHeaderLabels(['因子'] + factors)
+        for i, r in enumerate(factors):
+            self.tbl_bt_corr.setItem(i, 0, QTableWidgetItem(str(r)))
+            for j, c in enumerate(factors):
+                v = corr.loc[r, c]
+                s = '' if pd.isna(v) else f'{v:.2f}'
+                item = QTableWidgetItem(s)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if not pd.isna(v):
+                    if v >= 0:
+                        g = int(255 - 120 * min(1.0, v))
+                        item.setBackground(QBrush(QColor(255, g, g)))
+                    else:
+                        vv = min(1.0, -v)
+                        b2 = int(255 - 120 * vv)
+                        item.setBackground(QBrush(QColor(b2, b2, 255)))
+                self.tbl_bt_corr.setItem(i, j + 1, item)
+        self.tbl_bt_corr.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+
+    def _export_backtest_csv(self, d, list_type, caliber, mg, summary, ic, perf, roll, n_days, curve):
+        """T10：回测结果落盘到 reports/（受 config.backtest_cost.report_csv 控制）。
+
+        导出文件（均含 日期_清单_口径 戳，符合架构设计 §2）：
+          bt_detail_<stamp>.csv        单日明细（含 净收益%/无法成交）
+          bt_summary_<stamp>.csv       汇总（口径/成本/无法成交比例/基准净收益%）
+          bt_ic_<stamp>.csv            单策略 IC
+          bt_rolling_<stamp>.csv       滚动 IC（CI95+n）
+          bt_net_curve_<stamp>.csv     跨日等权净值（组合/基准）
+          bt_performance_<stamp>.csv   绩效指标（净/基准收益、Sharpe、最大回撤、胜率、成本、无法成交比例、n）
+        """
+        bcfg = self.cfg.get('backtest_cost', {})
+        if not bcfg.get('report_csv', False):
+            return
+        rdir = os.path.join(BASE_DIR, 'reports')
+        os.makedirs(rdir, exist_ok=True)
+        stamp = f'{d}_{list_type}_{caliber}'
+        try:
+            if mg is not None and not mg.empty:
+                mg.to_csv(os.path.join(rdir, f'bt_detail_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            if summary is not None:
+                pd.DataFrame([summary]).to_csv(os.path.join(rdir, f'bt_summary_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            if ic:
+                pd.DataFrame(ic).T.reset_index().rename(columns={'index': '策略'}).to_csv(
+                    os.path.join(rdir, f'bt_ic_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            if roll is not None and not roll.empty:
+                roll.to_csv(os.path.join(rdir, f'bt_rolling_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            if (curve or {}).get('sufficient'):
+                pc = (curve or {}).get('portfolio', {}).get('curve')
+                bc = (curve or {}).get('benchmark', {}).get('curve')
+                if pc is not None and bc is not None:
+                    pd.DataFrame({'净值_组合': pd.Series(pc.values, dtype='float64'),
+                                 '净值_基准': pd.Series(bc.values, dtype='float64')}).to_csv(
+                        os.path.join(rdir, f'bt_net_curve_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            # 绩效指标表（单日 perf + 跨日曲线，便于独立核验）
+            port = (curve or {}).get('portfolio', {})
+            suff = (curve or {}).get('sufficient')
+            perf_rows = [
+                ('口径', perf.get('caliber', caliber)),
+                ('样本n', perf.get('n', 0)),
+                ('可成交数', perf.get('n_tradable', 0)),
+                ('净组合收益%', round(perf.get('net_return', 0.0) * 100, 2)),
+                ('毛组合收益%', round(perf.get('gross_return', 0.0) * 100, 2)),
+                ('基准净收益%', round(perf.get('bench_return', 0.0) * 100, 2)),
+                ('双边成本%', round(perf.get('cost_pct', 0.0) * 100, 3)),
+                ('无法成交比例', round(perf.get('cant_trade_ratio', 0.0), 4)),
+                ('本日胜率', round(perf.get('win_rate', 0.0), 4)),
+                ('累计净收益%(跨日)', round(port.get('net_return', 0.0) * 100, 2) if suff else '样本不足'),
+                ('年化Sharpe(跨日)', round(port.get('sharpe', float('nan')), 2) if suff else '样本不足'),
+                ('最大回撤(跨日)', round(port.get('max_dd', 0.0) * 100, 2) if suff else '样本不足'),
+                ('跨日胜率', round(port.get('win_rate', 0.0), 4) if suff else '样本不足'),
+                ('可回测交易日', (curve or {}).get('n_days', 0)),
+            ]
+            pd.DataFrame(perf_rows, columns=['指标', '数值']).to_csv(
+                os.path.join(rdir, f'bt_performance_{stamp}.csv'), index=False, encoding='utf-8-sig')
+            self.log(f'回测报告已导出到 reports/（detail/summary/ic/rolling/net_curve/performance，{stamp}）')
+        except Exception:
+            self.log('导出回测CSV出错:\n' + traceback.format_exc())
 
     def apply_suggested_weights(self):
         if not self._suggested_weights:
@@ -614,6 +847,25 @@ class MainWindow(QMainWindow):
             self.tbl_weights.setItem(i, 1, QTableWidgetItem(str(v)))
         self.tbl_weights.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
+    def _sync_cfg_widgets(self):
+        """把 self.cfg 的回测成本/动态权重同步到界面控件（用于「恢复默认」后刷新）。"""
+        w = getattr(self, 'cfg_widgets', None)
+        if not w:
+            return
+        bcfg = self.cfg.get('backtest_cost', {})
+        dw = self.cfg.get('dynamic_weights', {})
+        w['bc_commission'].setValue(float(bcfg.get('commission', 0.00025)))
+        w['bc_stamp_tax'].setValue(float(bcfg.get('stamp_tax', 0.001)))
+        w['bc_slippage_main'].setValue(float(bcfg.get('slippage_main', 0.001)))
+        w['bc_slippage_20cm'].setValue(float(bcfg.get('slippage_20cm', 0.002)))
+        w['bc_caliber'].setCurrentText(str(bcfg.get('caliber', 'close')))
+        w['bc_report_csv'].setChecked(bool(bcfg.get('report_csv', False)))
+        w['dw_ema_window'].setValue(float(dw.get('ema_window', 10)))
+        w['dw_shrinkage_lambda'].setValue(float(dw.get('shrinkage_lambda', 0.3)))
+        w['dw_significance_alpha'].setValue(float(dw.get('significance_alpha', 0.05)))
+        w['dw_auto_kill_negative'].setChecked(bool(dw.get('auto_kill_negative', True)))
+        w['dw_enabled'].setChecked(bool(dw.get('enabled', True)))
+
     def save_cfg(self):
         try:
             for i in range(self.tbl_weights.rowCount()):
@@ -624,8 +876,22 @@ class MainWindow(QMainWindow):
                     self.cfg['thresholds'][key[3:]] = sp.value()
                 elif key in ('top_n', 'rise4_n', 'monday_n', 'tail_n'):
                     self.cfg[key] = int(sp.value())
-                else:
-                    self.cfg[key] = sp.value()
+            else:
+                self.cfg[key] = sp.value()
+            # T9（P0-1）：回测成本 / 动态权重 落盘
+            bcfg = self.cfg.setdefault('backtest_cost', {})
+            bcfg['commission'] = float(self.cfg_widgets['bc_commission'].value())
+            bcfg['stamp_tax'] = float(self.cfg_widgets['bc_stamp_tax'].value())
+            bcfg['slippage_main'] = float(self.cfg_widgets['bc_slippage_main'].value())
+            bcfg['slippage_20cm'] = float(self.cfg_widgets['bc_slippage_20cm'].value())
+            bcfg['caliber'] = self.cfg_widgets['bc_caliber'].currentText()
+            bcfg['report_csv'] = self.cfg_widgets['bc_report_csv'].isChecked()
+            dw = self.cfg.setdefault('dynamic_weights', {})
+            dw['ema_window'] = int(self.cfg_widgets['dw_ema_window'].value())
+            dw['shrinkage_lambda'] = float(self.cfg_widgets['dw_shrinkage_lambda'].value())
+            dw['significance_alpha'] = float(self.cfg_widgets['dw_significance_alpha'].value())
+            dw['auto_kill_negative'] = self.cfg_widgets['dw_auto_kill_negative'].isChecked()
+            dw['enabled'] = self.cfg_widgets['dw_enabled'].isChecked()
             strategies.save_config(BASE_DIR, self.cfg)
             self.log('参数已保存到 config.json')
             QMessageBox.information(self, '保存成功', '参数已保存，下次预测立即生效')
@@ -636,6 +902,7 @@ class MainWindow(QMainWindow):
         self.cfg = strategies.load_config('/nonexistent')  # 拿默认值
         strategies.save_config(BASE_DIR, self.cfg)
         self._load_weights_table()
+        self._sync_cfg_widgets()
         self.log('已恢复默认参数')
 
     def closeEvent(self, e):

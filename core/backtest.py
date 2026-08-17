@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-回测模块（backtest）v2.1
+回测模块（backtest）v2.5
 逻辑：predictions(run_date→target_date) ⋈ daily(target_date 实际数据)
 产出：
   1. 整体准确率：Top3/5/10 命中率、平均实际涨幅、基准对比
-  2. 清单得分：每张清单独立打分规则（涨停满分/按涨幅分档/下跌扣分），
-     得分规则见 SCORING_RULES，可在 config.json 的 "scoring" 节覆盖
+  2. 清单得分：每张清单独立打分规则（涨停满分/按涨幅分档/下跌扣分）
   3. 单策略表现：每个策略分 vs 实际涨幅 的 Spearman IC（分离评估哪个策略有效）
-  4. 滚动历史：多日累计 IC 均值 + 清单滚动平均得分
-  5. 调参建议 make_advice()：依据滚动 IC 与清单得分自动生成权重调整建议
+  4. 滚动历史：多日累计 IC 均值 + CI95 + 样本n + 清单滚动平均得分
+  5. 调参建议 make_advice()：基于滚动 IC + 增量IC + 因子相关性 自动生成权重调整建议
+
+本次升级（P0-2/P0-3/P0-1/P0-5/P0-6）：
+  - backtest_one 支持 收益口径(caliber) + 双边成本 + 等权净值/绩效 + 无法成交剔除
+  - rolling_ic 增 CI95 + 样本n + Bonferroni 显著性
+  - dynamic_weight_plan 改 shrinkage(EMA+显著性+λ收缩)，弃硬 kill 归零
+  - make_advice 增 因子相关性(五因子) + 正交后增量IC 段落
 """
 import json
 
 import numpy as np
 import pandas as pd
+
+from core import metrics
 
 STRATEGY_KEYS = ['S1封单强度', 'S2封板质量', 'S3锁仓度', 'S4资金', 'S5股性结构',
                  'A封单强度', 'B封板时间', 'C量能换手', 'D市值', 'E资金']  # 兼容v1命名
@@ -22,19 +29,12 @@ STRATEGY_KEYS = ['S1封单强度', 'S2封板质量', 'S3锁仓度', 'S4资金', 
 V2_KEYS = ['S1封单强度', 'S2封板质量', 'S3锁仓度', 'S4资金', 'S5股性结构']
 
 # ---------------- 清单打分规则 ----------------
-# 规则格式: [[涨幅下限%, 得分], ...] 按下限升序，取满足"实际涨幅 ≥ 下限"的最后一档。
-# 设计原则：达成清单目标 → 满分100；接近目标 → 分档给分；下跌 → 按幅度扣分（目标越激进扣得越狠）。
 DEFAULT_SCORING = {
-    # 目标：次日涨停。涨停100；涨6%+大肉75；小涨微利20~60；跌2%内小亏-10；跌6%+大面-80
     '涨停TopN': [[-99, -80], [-6, -50], [-4, -30], [-2, -10], [0, 20],
                  [2, 40], [4, 60], [6, 75], [9.5, 100]],
-    # 目标：次日涨≥4%。达成即100；涨2~4%接近40；下跌扣分（低吸半路风险小于打板，扣分温和）
     '涨幅4%': [[-99, -60], [-6, -40], [-4, -25], [-2, -10], [0, 15], [2, 40], [4, 100]],
-    # 目标：连板（已涨停股再涨停）。连板100；冲高未板50；断板亏钱快，扣分最狠
     '连板候选': [[-99, -100], [-6, -70], [-4, -45], [-2, -20], [0, 20], [4, 50], [9.5, 100]],
-    # 目标：尾盘买入次日溢价。≥2%即合格60；涨停100；跌2%内-15（尾盘买成本低，扣分温和）
     '尾盘选股': [[-99, -60], [-4, -35], [-2, -15], [0, 30], [2, 60], [4, 80], [9.5, 100]],
-    # 新增扩展清单（extensions 亦可声明并覆盖）
     '抄底清单': [[-99, -80], [-6, -50], [-4, -30], [-2, -15], [0, 20],
                  [2, 60], [4, 80], [6, 95], [9.5, 100]],
     '短线反转': [[-99, -80], [-6, -50], [-4, -30], [-2, -15], [0, 20],
@@ -50,8 +50,6 @@ HIT_THRESHOLD = {'涨停TopN': 9.5, '涨幅4%': 4.0, '连板候选': 9.5, '尾�
 LIST_TYPES = ['涨停TopN', '涨幅4%', '连板候选', '尾盘选股']
 
 # ---------------- 合并扩展框架注册的清单类型 ----------------
-# 扩展（extensions/）可声明自己的 list_type / scoring / hit_threshold / IC 键，
-# 在此自动并入，使「回测评估」下拉框、打分、达成率、单因子 IC 对其同样生效。
 try:
     from extensions import EXT_LIST_TYPES, EXT_SCORING, EXT_HIT, EXT_IC_KEYS
     if EXT_LIST_TYPES:
@@ -102,28 +100,107 @@ def _spearman(a, b):
         return None, None
 
 
-def backtest_one(db, target_date, list_type='涨停TopN', cfg=None):
-    """单日回测 → (明细df, 汇总dict, 策略IC dict)
-    明细df 增加 得分 列（按清单规则打分）；汇总含 平均得分/总得分/达成率。"""
+# =============================== 单日回测 ===============================
+def backtest_one(db, target_date, list_type='涨停TopN', cfg=None, caliber=None):
+    """单日回测 → (明细df, 汇总dict, 策略IC dict, 绩效dict)
+
+    明细df 新增列：口径收益% , 净收益% , 无法成交(bool) , 双边成本% , 组合净值(累计)
+    汇总新增：口径 , 双边成本% , 无法成交比例 , 样本n , 基准净收益% , 净组合收益%
+    绩效dict: net_return_curve 结构 + gross_return/bench_gross/bench_return/win_rate/...
+
+    口径(caliber)：
+      'close' = T日收盘→T+1收盘（用 daily['涨幅']）
+      'open'   = T+1开盘→T+1收盘（用 (1+涨幅/100)/(1+开盘涨幅/100)-1）
+      缺开盘涨幅时降级 'close' 并提示。
+    """
+    cfg = cfg or {}
+    bcfg = cfg.get('backtest_cost', {})
+    cal = caliber or bcfg.get('caliber', 'close')
     pred = db.get_predictions(target_date)
     pred = pred[pred['list_type'] == list_type]
     if pred.empty:
-        return None, None, None
+        return None, None, None, None
     actual = db.get_daily(target_date)
     if actual.empty:
-        return None, None, None
-    mg = pred.merge(actual[['代码6', '涨幅', '今日涨停']],
-                    left_on='code', right_on='代码6', how='inner')
+        return None, None, None, None
+    merge_cols = ['代码6', '涨幅', '今日涨停', '开盘涨幅', '封板分钟']
+    actual_cols = [c for c in merge_cols if c in actual.columns]
+    mg = pred.merge(actual[actual_cols], left_on='code', right_on='代码6', how='inner')
     if len(mg) < 3:
-        return None, None, None
+        return None, None, None, None
     mg = mg.sort_values('rank').reset_index(drop=True)
     mg = mg.rename(columns={'涨幅': '实际涨幅%', '今日涨停': '实际涨停'})
 
+    # M可买性（来自 detail，用于"无法成交"兜底判定）
+    det = mg['detail'].apply(lambda s: json.loads(s) if s else {})
+    mg['M可买性'] = det.apply(lambda x: x.get('M可买性'))
+
+    # ---- 口径收益% ----
+    if cal == 'open' and '开盘涨幅' in mg.columns and mg['开盘涨幅'].notna().any():
+        og = mg['开盘涨幅'].astype(float) / 100.0
+        zf = mg['实际涨幅%'].astype(float) / 100.0
+        mg['口径收益%'] = ((1.0 + zf) / (1.0 + og) - 1.0)
+        caliber_used = 'open(T+1开盘→收盘)'
+    else:
+        mg['口径收益%'] = mg['实际涨幅%'].astype(float) / 100.0
+        caliber_used = 'close(T日收盘→T+1收盘)' if cal != 'open' else 'close(降级:缺开盘涨幅)'
+
+    # ---- 双边成本% ----
+    mg['双边成本%'] = mg['代码6'].apply(
+        lambda c: round(metrics.per_trade_cost_pct(c, bcfg) * 100, 4))
+    mg['净收益%'] = (mg['口径收益%'] * 100 - mg['双边成本%']).round(3)
+
+    # ---- 无法成交：一字/秒板（涨停 且 封板分钟≤0.5；缺封板分钟则 M可买性<0.3）----
+    def _cant(r):
+        if not r['实际涨停']:
+            return False
+        fm = r.get('封板分钟')
+        if pd.notna(fm):
+            return float(fm) <= 0.5
+        mb = r.get('M可买性')
+        return (float(mb) < 0.3) if pd.notna(mb) else False
+
+    mg['无法成交'] = mg.apply(_cant, axis=1)
+
+    # ---- 等权组合（仅可成交股）----
+    trad = mg[~mg['无法成交']]
+    if len(trad) > 0:
+        costs = trad['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg))
+        net_i = trad['口径收益%'] - costs
+        port_gross = float(trad['口径收益%'].mean())
+        port_net = float(net_i.mean())
+        win_rate = float((net_i > 0).mean())
+        rep_code = trad['代码6'].iloc[0]
+    else:
+        port_gross = 0.0
+        port_net = 0.0
+        win_rate = 0.0
+        rep_code = mg['代码6'].iloc[0] if len(mg) > 0 else '600000'
+    cost_pct = float(mg['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg)).mean())
+    cant_ratio = float(mg['无法成交'].mean())
+
+    # ---- 基准：买全部涨停股（等权）----
+    lim = mg[mg['实际涨停']]
+    if len(lim) > 0:
+        bench_gross = float(lim['口径收益%'].mean())
+        # 注意：上方已把 今日涨停 重命名为 实际涨停，benchmark_curve 期望 '今日涨停' 列
+        bench_in = lim[['代码6', '口径收益%']].copy()
+        bench_in['今日涨停'] = lim['实际涨停'].values
+        bench = metrics.benchmark_curve(bench_in, bcfg)
+        bench_net = bench['net_return']
+        bench_code = lim['代码6'].iloc[0]
+    else:
+        bench_gross = 0.0
+        bench_net = 0.0
+        bench_code = rep_code
+
+    # ---- 得分（按清单规则）----
     rules = _scoring(cfg, list_type)
     mg['得分'] = mg['实际涨幅%'].apply(lambda x: score_row(x, rules))
     hit_th = HIT_THRESHOLD.get(list_type, 9.5)
 
-    summary = {'目标日': target_date, '清单': list_type, '预测数': len(pred), '匹配数': len(mg)}
+    summary = {'目标日': target_date, '清单': list_type, '口径': caliber_used,
+               '预测数': len(pred), '匹配数': len(mg), '可成交数': len(trad)}
     for n in (3, 5, 10):
         t = mg.head(min(n, len(mg)))
         summary[f'Top{n}涨停率'] = f"{t['实际涨停'].mean():.0%}"
@@ -132,12 +209,16 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None):
     summary['平均得分'] = f"{mg['得分'].mean():.1f}"
     summary['总得分'] = f"{mg['得分'].sum():.0f}"
     summary['达成率'] = f"{(mg['实际涨幅%'] >= hit_th).mean():.0%}（涨幅≥{hit_th}%）"
+    summary['净组合收益%'] = f"{port_net * 100:.2f}%"
+    summary['双边成本%'] = f"{cost_pct * 100:.3f}%"
+    summary['无法成交比例'] = f"{cant_ratio:.0%}"
+    summary['样本n'] = len(mg)
+    summary['基准净收益%'] = f"{bench_net * 100:.2f}%"
 
-    # 单策略 IC（从 detail JSON 拆出策略分）
+    # ---- 单策略 IC（从 detail JSON 拆出策略分）----
     ic = {}
-    details = mg['detail'].apply(lambda s: json.loads(s) if s else {})
     for key in STRATEGY_KEYS:
-        vals = details.apply(lambda d: d.get(key))
+        vals = det.apply(lambda d: d.get(key))
         vals = pd.to_numeric(vals, errors='coerce')
         mask = vals.notna() & mg['实际涨幅%'].notna()
         if mask.sum() >= 5 and vals[mask].nunique() > 2:
@@ -146,35 +227,85 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None):
                 ic[key] = {'IC(ρ)': rho, 'p值': round(p, 4),
                            '评价': '✅ 有效' if rho > 0.4 and p < 0.1
                            else ('⚠️ 弱' if rho > 0 else '❌ 无效/反向')}
-    return mg, summary, ic
+
+    # ---- 绩效 dict ----
+    perf = {
+        'gross_return': port_gross,
+        'net_return': port_net,
+        'bench_gross': bench_gross,
+        'bench_return': bench_net,
+        'bench_code': bench_code,
+        'win_rate': win_rate,
+        'cost_pct': cost_pct,
+        'cant_trade_ratio': cant_ratio,
+        'n': len(mg),
+        'n_tradable': len(trad),
+        'rep_code': rep_code,
+        'caliber': caliber_used,
+        'curve': metrics.net_return_curve(pd.Series([port_gross]),
+                                          pd.Series([rep_code]), bcfg),
+    }
+    # 组合净值(累计) 列（单日仅一点，便于明细展示）
+    mg['组合净值(累计)'] = round((1.0 + mg['口径收益%']
+                                  - mg['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg))).prod(), 4) \
+        if len(mg) > 0 else np.nan
+    return mg, summary, ic, perf
+
+
+# =============================== 每日 IC 矩阵（供滚动/显著性/动态权重复用） ===============================
+def _daily_ic_records(db, list_type='涨停TopN', cfg=None):
+    """yield (date, key, ic_rho, p) for each backtestable day & each factor with computable IC."""
+    out = []
+    for d in db.pending_backtest_dates():
+        _, _, ic, _ = backtest_one(db, d, list_type, cfg)
+        if not ic:
+            continue
+        for k, v in ic.items():
+            out.append((d, k, float(v['IC(ρ)']), float(v['p值'])))
+    return out
+
+
+def _daily_ic_matrix(db, list_type='涨停TopN', cfg=None):
+    """返回 (DataFrame[date×factor→IC], 可用天数)。"""
+    recs = _daily_ic_records(db, list_type, cfg)
+    if not recs:
+        return pd.DataFrame(), 0
+    rows, days = {}, set()
+    for d, k, ic, _p in recs:
+        rows.setdefault(d, {})[k] = ic
+        days.add(d)
+    return pd.DataFrame.from_dict(rows, orient='index'), len(days)
 
 
 def rolling_ic(db, list_type='涨停TopN', cfg=None):
-    """全部可回测日期的策略 IC 汇总（均值+次数）→ (DataFrame, 天数)"""
-    acc = {}
-    days = db.pending_backtest_dates()
-    used = 0
-    for d in days:
-        _, _, ic = backtest_one(db, d, list_type, cfg)
-        if not ic:
-            continue
-        used += 1
-        for k, v in ic.items():
-            acc.setdefault(k, []).append(v['IC(ρ)'])
-    if not acc:
+    """全部可回测日期的策略 IC 汇总（均值 + CI95 + 样本n + 显著性）→ (DataFrame, 天数)"""
+    mat, used = _daily_ic_matrix(db, list_type, cfg)
+    if mat.empty:
         return pd.DataFrame(), 0
-    rows = [{'策略': k, '平均IC': round(float(np.mean(v)), 3),
-             'IC>0天数': f"{sum(1 for x in v if x > 0)}/{len(v)}",
-             '评价': '✅ 稳定有效' if np.mean(v) > 0.3 else ('⚠️ 不稳定' if np.mean(v) > 0 else '❌ 建议下调权重')}
-            for k, v in acc.items()]
-    return pd.DataFrame(rows).sort_values('平均IC', ascending=False), used
+    sig = metrics.factor_significance(mat, alpha=0.05)
+    pos = {c: int((mat[c] > 0).sum()) for c in mat.columns}
+    ndays = {c: int(mat[c].notna().sum()) for c in mat.columns}
+    rows = []
+    for _, r in sig.iterrows():
+        k = r['策略']
+        rows.append({
+            '策略': k,
+            '平均IC': r['均值IC'],
+            'IC>0天数': f"{pos.get(k, 0)}/{ndays.get(k, 0)}",
+            'CI95低': r['CI95低'],
+            'CI95高': r['CI95高'],
+            '样本n': ndays.get(k, 0),
+            '评价': '✅ 稳定有效' if r['均值IC'] > 0.3
+            else ('⚠️ 不稳定' if r['均值IC'] > 0 else '❌ 建议下调权重'),
+        })
+    return pd.DataFrame(rows).sort_values('平均IC', ascending=False).reset_index(drop=True), used
 
 
 def rolling_score(db, list_type, cfg=None):
     """清单滚动得分汇总 → (DataFrame, 天数)。列：日期/匹配数/平均得分/总得分/达成率"""
     rows = []
     for d in db.pending_backtest_dates():
-        _, summary, _ = backtest_one(db, d, list_type, cfg)
+        _, summary, _, _ = backtest_one(db, d, list_type, cfg)
         if not summary:
             continue
         rows.append({'日期': d, '匹配数': summary['匹配数'],
@@ -186,91 +317,96 @@ def rolling_score(db, list_type, cfg=None):
     return pd.DataFrame(rows), len(rows)
 
 
-def dynamic_weight_plan(db, cfg, roll=None, used=None):
-    """逐因子动态权重计划。返回 (DataFrame 或 None, used天数)。
-    列：策略 | 滚动IC | IC>0天数 | 当前权重% | 建议权重% | 动作
+# =============================== 动态权重（P0-5 shrinkage） ===============================
+def _ema(vals, window):
+    """指数移动平均（最后一点）。vals 为 IC 序列。"""
+    s = pd.Series(vals, dtype='float64')
+    if s.empty:
+        return float('nan')
+    return float(s.ewm(span=max(1, window), adjust=False).mean().iloc[-1])
 
-    规则（见 config.dynamic_weights）：
-      - enabled=False        → 直接返回 None（不输出建议）
-      - 负IC因子 + auto_kill_negative=True → 建议权重=0（硬 kill 反向因子）
-      - 否则地板 floor（默认2%）
-      - 全负（total_pos<=0） → 空仓信号，全部归零
-      - 其余按 max(IC,0) 归一化 + 地板
-    注：受 min_days 约束，样本不足也返回 None。
+
+def dynamic_weight_plan(db, cfg, roll=None, used=None):
+    """逐因子动态权重计划 v2（shrinkage + EMA + Bonferroni 显著性）。
+
+    返回 (DataFrame 或 None, used天数)。
+    列：策略 | EMA_IC | p值 | 是否显著 | 当前权重% | 建议权重% | 动作
+
+    算法（见 config.dynamic_weights）：
+      对每日 IC 做 EMA 平滑(窗口=ema_window) → 单样本 t + Bonferroni(α/因子数) 判显著
+      → 不显著因子 shrinkage 至地板(不再归零) → w = (1-λ)·max(EMA_IC,0) + 地板 再归一
+    动作取值：✅上调 / ⚠️维持(噪声收缩至地板) / ❌不显著(收缩至地板)
+    （不再出现 "归零(kill)"）
     """
     dw = (cfg or {}).get('dynamic_weights', {})
     if not dw.get('enabled', True):
         return None, used if used is not None else 0
     floor = float(dw.get('floor', 0.02))
-    kill_neg = bool(dw.get('auto_kill_negative', True))
     min_days = int(dw.get('min_days', 3))
+    ema_window = int(dw.get('ema_window', 10))
+    lam = float(dw.get('shrinkage_lambda', 0.3))
+    alpha = float(dw.get('significance_alpha', 0.05))
+    # 仅对显著因子调权(Bonferroni)：保留 auto_kill_negative 键语义，作为显著性门槛开关
+    sig_gate = bool(dw.get('auto_kill_negative', True))
 
     if roll is None or used is None:
         roll, used = rolling_ic(db, '涨停TopN', cfg)
-    if roll.empty or used < min_days:
+    if used < min_days:
         return None, used
 
+    mat, _ = _daily_ic_matrix(db, '涨停TopN', cfg)
+    mat = mat[[c for c in V2_KEYS if c in mat.columns]]
+    if mat.empty:
+        return None, used
+
+    ema = {k: _ema(mat[k].dropna().tolist(), ema_window) for k in V2_KEYS if k in mat}
+    sig = metrics.factor_significance(mat[[k for k in V2_KEYS if k in mat.columns]],
+                                      alpha=alpha).set_index('策略')
+
     cur_w = {k: (cfg or {}).get('weights', {}).get(k, 0) for k in V2_KEYS}
-    mean_ic = {}
-    ic_pos_days = {}
-    for _, r in roll.iterrows():
-        k = r['策略']
-        if k not in V2_KEYS:
-            continue
-        mean_ic[k] = r['平均IC']
-        ic_pos_days[k] = r['IC>0天数']
 
-    # 判定硬kill（负IC因子 → 权重 0）+ 原始IC（>=0）
-    def _ic(k):
-        v = mean_ic.get(k, float('nan'))
-        return float('nan') if pd.isna(v) else float(v)
-
-    killed = {k: (kill_neg and (pd.isna(mean_ic.get(k)) or mean_ic.get(k) <= 0))
-              for k in V2_KEYS}
-    raw = {k: (0.0 if killed[k] else max(_ic(k), 0.0)) for k in V2_KEYS}
-    total_raw = sum(raw.values())
-
-    sug = {}
-    if total_raw <= 0:
-        # 全部反向/无效：空仓信号，权重全 0
-        sug = {k: 0.0 for k in V2_KEYS}
-    elif kill_neg:
-        active = [k for k in V2_KEYS if not killed[k]]
-        scale = (1 - floor * len(active)) / total_raw
-        for k in V2_KEYS:
-            sug[k] = 0.0 if killed[k] else floor + raw[k] * scale
+    # shrinkage + 地板
+    raw = {}
+    for k in V2_KEYS:
+        e = ema.get(k, float('nan'))
+        significant = bool(sig.loc[k, '是否显著']) if k in sig.index else False
+        if pd.isna(e) or e <= 0:
+            raw[k] = 0.0
+        elif sig_gate and not significant:
+            raw[k] = 0.0          # 不显著 → 收缩至地板（不再归零）
+        else:
+            raw[k] = (1.0 - lam) * max(e, 0.0)
+    total = sum(raw.values())
+    if total <= 0:
+        sug = {k: floor for k in V2_KEYS}
     else:
-        # 不硬kill：负IC也给地板，按 max(IC,0) 归一
-        scale = (1 - floor * len(V2_KEYS)) / total_raw
-        for k in V2_KEYS:
-            sug[k] = floor + raw[k] * scale
+        sug = {k: floor + raw[k] for k in V2_KEYS}
+    ssum = sum(sug.values())
+    sug = {k: sug[k] / ssum for k in V2_KEYS}
 
     rows = []
     for k in V2_KEYS:
-        ic = _ic(k)
-        if killed[k]:
-            action = '❌ 归零(kill)'
-        elif ic < 0.2:
-            action = '⚠️ 维持/下调'
-        else:
+        e = ema.get(k, float('nan'))
+        p = float(sig.loc[k, 'p']) if k in sig.index else float('nan')
+        significant = bool(sig.loc[k, '是否显著']) if k in sig.index else False
+        cw = round(float(cur_w.get(k, 0)) * 100)
+        sw = round(float(sug[k]) * 100)
+        if (not significant) and (not pd.isna(e)):
+            action = '❌ 不显著(收缩至地板)'
+        elif sw > cw * 1.05:
             action = '✅ 上调'
-        rows.append({
-            '策略': k,
-            '滚动IC': None if pd.isna(ic) else round(ic, 3),
-            'IC>0天数': ic_pos_days.get(k, '-'),
-            '当前权重%': round(float(cur_w.get(k, 0)) * 100),
-            '建议权重%': round(float(sug[k]) * 100),
-            '动作': action,
-        })
+        else:
+            action = '⚠️ 维持(噪声收缩至地板)'
+        rows.append({'策略': k, 'EMA_IC': None if pd.isna(e) else round(e, 3),
+                     'p值': None if pd.isna(p) else round(p, 4),
+                     '是否显著': significant, '当前权重%': cw,
+                     '建议权重%': sw, '动作': action})
     return pd.DataFrame(rows), used
 
 
+# =============================== 市场环境建议（保留） ===============================
 def regime_style_advice(cfg=None, timeout=15):
-    """基于数据源（默认 AKShare 实时行情）判断当前市场环境，给出风格/清单配置建议。
-    走 extensions.datasources 抽象：数据源由
-      cfg['extensions']['market_regime']['datasource'] 决定（默认 akshare）。
-    返回 (regime_label, text_lines, list_focus)。失败返回 ('unknown', ['无法获取市场状态'], [])。
-    """
+    """基于数据源（默认 AKShare 实时行情）判断当前市场环境，给出风格/清单配置建议。"""
     cfg = cfg or {}
     try:
         from extensions.datasources import get_source
@@ -284,7 +420,6 @@ def regime_style_advice(cfg=None, timeout=15):
         if src is None:
             return 'unknown', [f'未找到数据源「{ds_key}」，请检查 extensions/datasources'], []
 
-        # 构造最小 ctx 并通过数据源 fetch 获取数据（含市场活跃度）
         class _Ctx:
             pass
         ctx = _Ctx()
@@ -306,7 +441,6 @@ def regime_style_advice(cfg=None, timeout=15):
         regime = row['状态']
         note = row['建议']
 
-        # 风格配置建议
         if regime == 'risk_on':
             lines = [
                 f'【市场状态】risk_on（动量友好） | {note}',
@@ -347,15 +481,13 @@ def regime_style_advice(cfg=None, timeout=15):
         return 'unknown', [f'市场环境识别失败（{e}），请检查网络或AKShare版本'], []
 
 
+# =============================== 调参建议（P0-1/P0-5/P0-6） ===============================
 def make_advice(db, cfg):
-    """调参建议引擎：基于全部可回测日的滚动 IC + 清单滚动得分，生成文字建议。
+    """调参建议引擎：基于滚动 IC + 因子相关性 + 增量IC，生成文字建议。
+
     返回 (建议文本list, 建议权重dict or None, 动态权重计划DataFrame or None)。
-    规则：
-      滚动IC ≤ 0      → 该策略反向/无效，建议下调（给出具体数值）
-      0 < IC < 0.2    → 不稳，维持或小降
-      IC ≥ 0.2        → 有效，可上调
-      建议权重 = max(IC,0) 归一化（地板2%），样本<3天不出数值建议
-      清单平均分 < 25 → 该清单整体表现差，给出口径级建议
+    新增段落：【策略IC显著性(Bonferroni)】【因子相关性(五因子)】【正交后增量IC】
+    严禁"归零/kill/冻结"等自动写盘表述（权重仅用户显式点击时落盘）。
     """
     advice = []
     days = db.pending_backtest_dates()
@@ -363,7 +495,7 @@ def make_advice(db, cfg):
     if n_days == 0:
         return ['暂无可回测数据：先「生成预测」，次日收盘数据入库后再回测。'], None, None
 
-    # ---- 市场环境 + 风格建议（基于 AKShare 实时数据） ----
+    # ---- 市场环境 + 风格建议 ----
     regime, regime_lines, _focus = regime_style_advice(cfg)
     advice.extend(regime_lines)
     advice.append('')
@@ -387,12 +519,12 @@ def make_advice(db, cfg):
             elif lt == '尾盘选股':
                 advice.append('      → 尾盘溢价不稳定：建议提高「强势」因子权重、避开高位股')
 
-    # ---- 策略级 IC（基于涨停TopN清单的 detail 拆包） ----
+    # ---- 策略级 IC（基于涨停TopN 清单的 detail 拆包）----
     roll, used = rolling_ic(db, '涨停TopN', cfg)
     if roll.empty or used < 1:
         advice.append('【策略IC】样本不足（需预测时含五策略分明细，且至少1天可回测）')
         return advice, None, None
-    advice.append(f'【策略IC】（基于涨停TopN清单，{used} 天）')
+    advice.append(f'【策略IC】（基于涨停TopN清单，{used} 天；含 CI95 与 样本n）')
     cur_w = {k: (cfg or {}).get('weights', {}).get(k, 0) for k in V2_KEYS}
     seen = set()
     for _, r in roll.iterrows():
@@ -402,17 +534,58 @@ def make_advice(db, cfg):
         seen.add(k)
         w_pct = round(cur_w.get(k, 0) * 100)
         if r['平均IC'] <= 0:
-            advice.append(f'  ❌ {k}：滚动IC={r["平均IC"]:+.3f}（IC>0 {r["IC>0天数"]}）'
-                          f'→ 反向拖后腿，建议归零/下调')
+            advice.append(f'  ❌ {k}：平均IC={r["平均IC"]:+.3f}（IC>0 {r["IC>0天数"]}，'
+                          f'CI95[{r["CI95低"]:+.2f},{r["CI95高"]:+.2f}]，n={r["样本n"]}）'
+                          f'→ 反向拖后腿，建议下调权重')
         elif r['平均IC'] < 0.2:
-            advice.append(f'  ⚠️ {k}：滚动IC={r["平均IC"]:+.3f} → 效果不稳，建议维持或小幅下调（当前 {w_pct}%）')
+            advice.append(f'  ⚠️ {k}：平均IC={r["平均IC"]:+.3f}（CI95[{r["CI95低"]:+.2f},'
+                          f'{r["CI95高"]:+.2f}]，n={r["样本n"]}）→ 效果不稳，建议维持或小幅下调'
+                          f'（当前 {w_pct}%）')
         else:
-            advice.append(f'  ✅ {k}：滚动IC={r["平均IC"]:+.3f} → 有效，可适度上调（当前 {w_pct}%）')
+            advice.append(f'  ✅ {k}：平均IC={r["平均IC"]:+.3f}（CI95[{r["CI95低"]:+.2f},'
+                          f'{r["CI95高"]:+.2f}]，n={r["样本n"]}）→ 有效，可适度上调（当前 {w_pct}%）')
     for k in V2_KEYS:
         if k not in seen:
-            advice.append(f'  ℹ️ {k}：得分几乎无区分度，IC 无法计算 → 维持现状观察（当前 {round(cur_w.get(k, 0) * 100)}%）')
+            advice.append(f'  ℹ️ {k}：得分几乎无区分度，IC 无法计算 → 维持现状观察'
+                          f'（当前 {round(cur_w.get(k, 0) * 100)}%）')
 
-    # ---- 动态权重计划（基于滚动IC，自动归零负IC因子） ----
+    # ---- 策略IC 显著性（Bonferroni 多重比较校正）----
+    advice.append('')
+    advice.append('【策略IC显著性(Bonferroni)】单样本t检验 + α/因子数 校正（防多重比较假显著）')
+    mat, _ = _daily_ic_matrix(db, '涨停TopN', cfg)
+    mat = mat[[c for c in V2_KEYS if c in mat.columns]]
+    if not mat.empty:
+        sig = metrics.factor_significance(mat, alpha=0.05)
+        for _, r in sig.iterrows():
+            mark = '✅显著' if r['是否显著'] else '—不显著'
+            advice.append(f'  {r["策略"]}: 均值IC={r["均值IC"]:+.3f}  '
+                          f'CI95[{r["CI95低"]:+.2f},{r["CI95高"]:+.2f}]  '
+                          f'p={r["p"]:.3f}  α_b={r["Bonferroniα"]}  {mark}  n={r["样本天数n"]}')
+
+    # ---- 因子相关性（五因子 Spearman 相关矩阵，跨日均值）----
+    advice.append('')
+    advice.append('【因子相关性(五因子)】Spearman 相关矩阵（跨回测日截面均值，共线参考）')
+    corr = metrics.factor_correlation(db, cfg, method='spearman')
+    if not corr.empty:
+        header = '         ' + ''.join(f'{c:>8}' for c in corr.columns)
+        advice.append('  ' + header)
+        for idx in corr.index:
+            row = ''.join(f'{corr.loc[idx, c]:>8.2f}' for c in corr.columns)
+            advice.append(f'  {idx:>8}' + row)
+
+    # ---- 正交后增量 IC ----
+    advice.append('')
+    advice.append('【正交后增量IC】以实际涨幅为因、其余4因子回归得残差，再算该因子 vs 残差 的 Spearman IC')
+    inc = metrics.incremental_ic(db, '涨停TopN', cfg)
+    if not inc.empty:
+        for _, r in inc.iterrows():
+            advice.append(f'  {r["因子"]}: 原始IC={r["IC(原始)"]:+.3f}  '
+                          f'增量IC={r["增量IC"]:+.3f}  p={r["增量IC_p"]:.3f}  '
+                          f'独立增量贡献={r["独立增量贡献%"]:.1f}%')
+        advice.append('  （独立增量贡献%：该因子在剔除其余4因子后的增量解释力占比；'
+                      '某因子"对角"增量最高说明其信息最独立）')
+
+    # ---- 动态权重计划（shrinkage + EMA + 显著性）----
     advice.append('')
     plan, _ = dynamic_weight_plan(db, cfg, roll, used)
     sug = None
@@ -424,11 +597,15 @@ def make_advice(db, cfg):
             advice.append(f'【动态权重】样本 {used} 天 < {dw.get("min_days", 3)} 天，'
                           f'暂不出数值建议；继续积累回测天数。')
     else:
-        kill = dw.get('auto_kill_negative', True)
         floor = float(dw.get('floor', 0.02))
+        lam = float(dw.get('shrinkage_lambda', 0.3))
+        sig_gate = bool(dw.get('auto_kill_negative', True))
         sug = {r['策略']: round(r['建议权重%'] / 100, 4) for _, r in plan.iterrows()}
-        advice.append(f'【动态权重建议】{used} 天滚动IC | 地板{floor*100:.0f}% | '
-                      f'负IC{"归零" if kill else f"{floor*100:.0f}%地板"} | 可一键应用到「策略参数」页')
+        advice.append(f'【动态权重建议】{used} 天 | 地板{floor*100:.0f}% | '
+                      f'λ={lam} shrinkage | '
+                      f'{"仅显著因子调权(Bonferroni)" if sig_gate else "全因子按EMA_IC加权"}'
+                      f' | 可一键应用到「策略参数」页（须用户显式点击，不自动冻结）')
         for _, r in plan.iterrows():
-            advice.append(f'  {r["策略"]}: {r["当前权重%"]}% → 建议 {r["建议权重%"]}%  [{r["动作"]}]')
+            advice.append(f'  {r["策略"]}: {r["当前权重%"]}% → 建议 {r["建议权重%"]}%  '
+                          f'[{r["动作"]}]  (EMA_IC={r["EMA_IC"]}, p={r["p值"]})')
     return advice, sug, plan

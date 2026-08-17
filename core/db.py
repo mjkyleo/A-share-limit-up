@@ -115,7 +115,7 @@ class DB:
         if detail_keys is None:
             prefix_keys = ('S', 'M', 'R', 'P')
             fixed = ('综合分', '涨4评分', '连板潜力', '尾盘评分', '类型', '今日涨停',
-                     '强势', '资金', '量能', '位置')
+                     '封板分钟', '强势', '资金', '量能', '位置')
             def _keep(k):
                 return str(k).startswith(prefix_keys) or k in fixed
         else:

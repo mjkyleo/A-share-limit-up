@@ -23,7 +23,9 @@ DEFAULT_CONFIG = {
     'base_rise4': 0.10,         # 任意股次日涨幅≥4%基准（经验值，可回测校准）
     # ---- 阈值 ----
     'thresholds': {
-        '涨停判定涨幅': 9.5,        # 主板10%口径，创业板/科创板20cm需另行区分
+        '涨停判定涨幅': 9.5,        # 主板10%口径
+    '涨停判定涨幅_20cm': 19.5,  # 创业板(300/301)/科创板(688) 20cm 口径
+    '涨停判定涨幅_30cm': 29.5,  # 北交所(8/4/92/920) 30cm 口径（样本少，结论弱）
         '封流比_强': 3.0, '封流比_极强': 5.0,
         '封成比_强': 3.0, '封成比_极强': 10.0,
         '锁仓换手_极紧': 3.0, '锁仓换手_紧': 8.0, '锁仓换手_松': 15.0,
@@ -57,6 +59,33 @@ DEFAULT_CONFIG = {
     },
     # ---- 交易日历补充（额外闭市日 ['20261225', ...]） ----
     'extra_holidays': [],
+    # ---- 回测成本（双边，全可配；公式见 P0 Q1） ----
+    'backtest_cost': {
+        'commission': 0.00025,     # 单边佣金 万2.5
+        'stamp_tax': 0.001,        # 卖出印花税 0.1%
+        'slippage_main': 0.001,    # 主板滑点 0.1%
+        'slippage_20cm': 0.002,    # 创业板/科创板滑点 0.2%
+        'caliber': 'close',        # 收益口径：close=T日收盘→T+1收盘；open=T+1开盘→T+1收盘
+        'report_csv': False,       # 是否导出净值/绩效 CSV 到 reports/
+    },
+    # ---- 择时（L1）开关 ----
+    'timing': {
+        'method': 'synthetic',     # auto→取本值；可强制 'index'/'breadth'/'synthetic'
+        'enabled': True,
+        'breadth_fallback': True,  # 合成择时失败→回退宽度代理
+    },
+    # ---- 动态权重（P0-5 shrinkage，全可配） ----
+    'dynamic_weights': {
+        'enabled': True,
+        'auto_kill_negative': True,   # 保留键：shrinkage 模式忽略硬 kill，用作"仅对显著因子调权"
+        'auto_apply': False,          # 禁止自动冻结：仅用户点击"一键应用建议权重"时写盘
+        'floor': 0.02,                # 有效因子权重地板 2%
+        'min_days': 3,                # 可回测天数达此值才出数值建议
+        'ema_window': 10,             # EMA 平滑窗口（交易日）
+        'shrinkage_lambda': 0.3,      # 向 0 收缩系数 λ
+        'significance_alpha': 0.05,   # Bonferroni 显著性 α
+        'method': 'shrinkage',        # 默认 shrinkage（弃硬 kill 归零）
+    },
 }
 
 
@@ -79,6 +108,61 @@ def load_config(base_dir):
 def save_config(base_dir, cfg):
     path = os.path.join(base_dir, 'config.json')
     json.dump(cfg, open(path, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+
+
+# =============================== 板块识别 / 涨停判定（P0-7 唯一入口） ===============================
+def board_of(code: str) -> str:
+    """股票所属板块（按代码前缀）。
+
+    返回：
+      'main' 主板（60 / 000 / 001 / 002 / 003）
+      'cyb'  创业板（300 / 301）
+      'star' 科创板（688）
+      'bse'  北交所（8 / 4 / 92 / 920）
+      'other' 无法识别
+    """
+    s = str(code).strip()
+    digits = ''.join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return 'other'
+    if digits.startswith('688'):
+        return 'star'
+    if digits.startswith('300') or digits.startswith('301'):
+        return 'cyb'
+    if (digits.startswith('920') or digits.startswith('92')
+            or digits.startswith('8') or digits.startswith('4')):
+        return 'bse'
+    if (digits.startswith('60') or digits.startswith('000') or digits.startswith('001')
+            or digits.startswith('002') or digits.startswith('003')):
+        return 'main'
+    return 'other'
+
+
+def is_limit_up(code: str, change_pct, th: dict) -> bool:
+    """涨停判定唯一入口（禁止在别处硬编码 9.5）。
+
+    阈值由 board_of 决定：
+      main  → th['涨停判定涨幅']（默认 9.5）
+      cyb/star → th.get('涨停判定涨幅_20cm', 19.5)
+      bse   → th.get('涨停判定涨幅_30cm', 29.5)
+      other → th['涨停判定涨幅']（保守主板口径）
+    """
+    try:
+        v = float(change_pct)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(v, float) and np.isnan(v):
+        return False
+    board = board_of(code)
+    if board == 'main':
+        th_v = float(th.get('涨停判定涨幅', 9.5))
+    elif board in ('cyb', 'star'):
+        th_v = float(th.get('涨停判定涨幅_20cm', 19.5))
+    elif board == 'bse':
+        th_v = float(th.get('涨停判定涨幅_30cm', 29.5))
+    else:
+        th_v = float(th.get('涨停判定涨幅', 9.5))
+    return v >= th_v
 
 
 # =============================== 涨停预测五策略 ===============================
@@ -304,7 +388,9 @@ def run_tail_session(df, cfg):
     if '涨幅' not in df.columns:
         return pd.DataFrame(), '盘中快照缺少「涨幅」列，无法选股'
     if '今日涨停' not in df.columns:
-        df['今日涨停'] = df['涨幅'] >= th['涨停判定涨幅']
+        _codes = df['代码6'] if '代码6' in df.columns else df.get('代码', df.index)
+        df['今日涨停'] = [is_limit_up(c, z, th)
+                          for c, z in zip(_codes, df['涨幅'])]
     # 只保留有上涨动能的候选：已涨停 或 涨幅≥1%（阴跌股无尾盘博弈价值）
     pool = df[(df['今日涨停']) | (df['涨幅'].fillna(-99) >= 1)].copy()
     if pool.empty:
@@ -338,7 +424,9 @@ def run_prediction(df, cfg):
     th = cfg['thresholds']
     df = df.copy()
     if '今日涨停' not in df.columns:
-        df['今日涨停'] = df['涨幅'] >= th['涨停判定涨幅']
+        _codes = df['代码6'] if '代码6' in df.columns else df.get('代码', df.index)
+        df['今日涨停'] = [is_limit_up(c, z, th)
+                          for c, z in zip(_codes, df['涨幅'])]
     for name, fn in STRAT_FNS.items():
         df[name] = df.apply(lambda r: fn(r, th), axis=1).round(3)
 

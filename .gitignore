@@ -30,6 +30,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# ----- Stray Windows device-name artifact -----
+nul
+
 # ----- Virtual environments -----
 venv/
 .venv/

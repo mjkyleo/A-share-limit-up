@@ -11,6 +11,8 @@
   "base_rise4": 0.1,
   "thresholds": {
     "涨停判定涨幅": 9.5,
+    "涨停判定涨幅_20cm": 19.5,
+    "涨停判定涨幅_30cm": 29.5,
     "封流比_强": 3.0,
     "封流比_极强": 5.0,
     "封成比_强": 3.0,
@@ -163,12 +165,29 @@
     ]
   },
   "extra_holidays": [],
+  "backtest_cost": {
+    "commission": 0.00025,
+    "stamp_tax": 0.001,
+    "slippage_main": 0.001,
+    "slippage_20cm": 0.002,
+    "caliber": "close",
+    "report_csv": false
+  },
+  "timing": {
+    "method": "synthetic",
+    "enabled": true,
+    "breadth_fallback": true
+  },
   "dynamic_weights": {
     "enabled": true,
     "auto_kill_negative": true,
     "auto_apply": false,
     "floor": 0.02,
-    "min_days": 3
+    "min_days": 3,
+    "ema_window": 10,
+    "shrinkage_lambda": 0.3,
+    "significance_alpha": 0.05,
+    "method": "shrinkage"
   },
   "extensions": {
     "bottom_fishing": {

@@ -32,9 +32,9 @@ import pandas as pd
 
 
 # ============================================================== L1 择时
-def fetch_sh_index(ak=None, symbol: str = "sh000001", lookback: int = 130):
-    """获取上证指数日线，返回 DataFrame[date, close]（close 为 float）。
-    取数失败或数据不足返回 None。"""
+def fetch_index(ak=None, symbol: str = "sh000001", lookback: int = 130):
+    """泛型获取指数日线（P0-8 重构：原 fetch_sh_index 的泛型版）。
+    返回 DataFrame[date, close]（close 为 float）。取数失败或数据不足返回 None。"""
     if ak is None:
         try:
             import akshare as ak  # noqa
@@ -53,6 +53,10 @@ def fetch_sh_index(ak=None, symbol: str = "sh000001", lookback: int = 130):
         return df
     except Exception:
         return None
+
+
+# 兼容别名（旧调用 fetch_sh_index 仍可工作）
+fetch_sh_index = fetch_index
 
 
 def _regime_from_score(score: float):
@@ -139,17 +143,70 @@ def timing_from_breadth(u: pd.DataFrame):
 
 
 def market_timing(u: pd.DataFrame, ak=None, force_method: str = "auto"):
-    """统一择时入口。force_method ∈ {auto,index,breadth}。"""
+    """统一择时入口。force_method ∈ {auto, index, breadth, synthetic}。"""
     if force_method == "breadth":
         return timing_from_breadth(u)
+    if force_method == "synthetic":
+        return synthetic_timing(u, ak=ak, cfg=None)
     if force_method == "index":
-        idx = fetch_sh_index(ak)
+        idx = fetch_index(ak, "sh000001")
         return timing_from_index(idx) if idx is not None else timing_from_breadth(u)
     # auto：优先真指数
-    idx = fetch_sh_index(ak)
+    idx = fetch_index(ak, "sh000001")
     if idx is not None:
         return timing_from_index(idx)
     return timing_from_breadth(u)
+
+
+def index_timing(close_s: pd.DataFrame, symbol: str = "sh000001") -> dict:
+    """单指数择时（P0-8 组件）。close_s 来自 fetch_index。返回含 method='index:<symbol>'。"""
+    r = timing_from_index(close_s)
+    r = dict(r)
+    r["method"] = f"index:{symbol}"
+    r["symbol"] = symbol
+    return r
+
+
+def breadth_timing(u: pd.DataFrame) -> dict:
+    """无指数时的回退：用自选池「市场宽度」代理择时（P0-8 组件）。"""
+    return timing_from_breadth(u)
+
+
+def synthetic_timing(u: pd.DataFrame, ak=None, cfg: dict = None) -> dict:
+    """合成择时（P0-8 核心）：叠加 上证 sh000001 + 中证1000 000852 + 创业板指 399006
+    + 全市场涨跌家数宽度 四分量，对各分量仓位系数取均值得到合成信号。
+    AKShare 取数失败的分量自动跳过；全失败则回退宽度代理（优雅降级）。"""
+    cfg = cfg or {}
+    comps = {}
+    # 1) 上证指数
+    idx_sh = fetch_index(ak, "sh000001")
+    if idx_sh is not None:
+        comps["sh000001"] = float(timing_from_index(idx_sh)["coeff"])
+    # 2) 中证1000
+    idx_1000 = fetch_index(ak, "000852")
+    if idx_1000 is not None:
+        comps["000852"] = float(timing_from_index(idx_1000)["coeff"])
+    # 3) 创业板指
+    idx_cyb = fetch_index(ak, "399006")
+    if idx_cyb is not None:
+        comps["399006"] = float(timing_from_index(idx_cyb)["coeff"])
+    # 4) 全市场涨跌家数宽度（池内代理）
+    try:
+        comps["breadth"] = float(timing_from_breadth(u)["coeff"])
+    except Exception:
+        pass
+
+    if not comps:
+        return timing_from_breadth(u)
+
+    coeff = float(np.mean(list(comps.values())))
+    score = float(np.clip(coeff * 100, 0, 100))
+    regime, c = _regime_from_score(score)
+    detail = ("合成择时(" + ", ".join(f"{k}={v:.2f}" for k, v in comps.items())
+              + f") → 均值仓位系数={coeff:.2f}")
+    return {"method": "synthetic", "regime": regime, "score": round(score, 1),
+            "coeff": coeff, "detail": detail, "index_close": None,
+            "index_ret5": None, "index_ret20": None, "components": comps}
 
 
 # ============================================================== L2 板块主线
@@ -266,13 +323,26 @@ def leader_score(u: pd.DataFrame, sector_df: pd.DataFrame,
 def topdown_rank(u: pd.DataFrame, ak=None, top_n_sectors: int = 5,
                  min_sector_count: int = 3, force_method: str = "auto",
                  weight_sector: int = 40, weight_leader: int = 60,
-                 gate_non_main: int = 70):
+                 gate_non_main: int = 70, cfg: dict = None):
     """端到端：择时 → 板块 → 龙头 → 综合。
     返回 (timing_dict, sector_df, ranked_df)。
     ranked_df 含：代码,名称,所属行业,综合得分,择时系数,市道,是否在主线,
                   板块强度,龙头评分,5日涨幅,10日涨幅,20日涨幅,主力净量,流通市值,现价,市盈,市净率,排名
+
+    force_method ∈ {auto, index, breadth, synthetic}：
+      auto → 取 cfg['timing']['method']（默认 synthetic）；synthetic 失败优雅降级 market_timing。
     """
-    timing = market_timing(u, ak=ak, force_method=force_method)
+    method = force_method
+    if method == "auto":
+        method = (cfg or {}).get("timing", {}).get("method", "synthetic")
+    if method == "synthetic":
+        try:
+            timing = synthetic_timing(u, ak=ak, cfg=cfg)
+        except Exception:
+            # 合成择时失败（如 AKShare 不可用）→ 优雅降级宽度代理
+            timing = market_timing(u, ak=ak, force_method="breadth")
+    else:
+        timing = market_timing(u, ak=ak, force_method=method)
     coeff = timing["coeff"]
 
     sector_df = sector_strength(u, min_count=min_sector_count)

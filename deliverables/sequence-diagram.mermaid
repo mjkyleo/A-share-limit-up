@@ -1,0 +1,60 @@
+sequenceDiagram
+    participant U as 用户
+    participant App as app.predict
+    participant Loader as loader.load_dataset
+    participant Str as strategies.run_prediction
+    participant DB as db
+
+    U->>App: 点击「生成预测」
+    App->>Loader: load_dataset(DATA_DIR)
+    Loader->>Loader: clean() 每行 is_limit_up(代码6,涨幅,th) 算 今日涨停
+    Loader-->>App: 合并df(今日涨停已按板块判定)
+    App->>Str: run_prediction(df, cfg)
+    Str->>Str: 若缺 今日涨停 → is_limit_up 补全(不再用 9.5 硬阈值)
+    Str->>Str: 计算 S1~S5 / P1/P2/P3 / 综合分
+    Note over Str: 列名仍叫 预估涨停概率% (内部)
+    Str-->>App: {涨停TopN, 涨幅4%, 连板候选, 全量}
+    App->>App: 显示时 rename 预估涨停概率%→排序分(非真实概率) + 脚注
+    App->>DB: save_predictions(..., detail含 S1~S5/封板分钟)
+
+---
+
+sequenceDiagram
+    participant U as 用户
+    participant App as app.run_backtest
+    participant BT as backtest.backtest_one
+    participant M as metrics
+    participant DB as db
+
+    U->>App: 选 目标日+清单+口径(close/open)
+    App->>BT: backtest_one(db, date, list, cfg, caliber)
+    BT->>DB: get_predictions(target) + get_daily(target)
+    BT->>BT: merge(代码6, 涨幅, 开盘涨幅, 今日涨停, detail)
+    BT->>BT: 计算 口径收益% (close=涨幅/100; open=(1+涨幅)/(1+开盘涨幅)-1)
+    BT->>BT: 标 无法成交 = 一字/秒板(封板分钟<=0.5)→剔除组合
+    BT->>M: per_trade_cost_pct(code, bcfg) 逐股双边成本
+    BT->>M: net_return_curve(口径收益, codes, bcfg)
+    M-->>BT: {curve, sharpe, max_dd, win_rate, net_return}
+    BT->>M: benchmark_curve(actual[今日涨停], bcfg)
+    M-->>BT: 基准净值/收益
+    BT-->>App: (明细df, 汇总[口径,成本%,无法成交比例,n], ic, 绩效)
+    App->>App: 展示 净值曲线(可选PNG)+Sharpe+回撤+胜率+基准对照
+    Note over App: 口径 Radio 切换只改 cfg['backtest_cost']['caliber']
+
+---
+
+sequenceDiagram
+    participant App as app.run_backtest
+    participant BT as backtest.make_advice
+    participant M as metrics
+    participant DB as db
+
+    App->>BT: make_advice(db, cfg)
+    BT->>M: daily_ic_series(db) → 每日IC矩阵
+    M->>M: factor_significance(每日IC, α=0.05) 单样本t + Bonferroni
+    BT->>M: factor_correlation(db) 五因子相关矩阵
+    BT->>M: incremental_ic(db) 正交后增量IC
+    BT->>BT: rolling_ic 展示 CI95 + n
+    BT->>BT: dynamic_weight_plan v2 (EMA+shrinkage+显著性)
+    BT-->>App: 建议文本(含 CI/多重比较/相关性/增量IC) + 建议权重 + 计划表
+    App->>App: 渲染 相关性热力图(彩色表) + 增量IC表 + 动态权重(shrinkage文案)

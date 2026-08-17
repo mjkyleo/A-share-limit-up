@@ -281,7 +281,12 @@ def clean(df):
     out['封板分钟'] = out['首封时间'].apply(time_to_min) if '首封时间' in out else np.nan
     if '代码' in out.columns:
         out['代码6'] = out['代码'].astype(str).str.extract(r'(\d{6})')
-    out['今日涨停'] = (out['涨幅'] >= 9.5) if '涨幅' in out else False
+    # P0-7：涨停判定唯一入口（按板块分 9.5/19.5/29.5 线），禁止硬编码 9.5
+    from core import strategies as _strat
+    out['今日涨停'] = (out.apply(
+        lambda r: _strat.is_limit_up(r.get('代码6', ''), r.get('涨幅'),
+                                     _strat.DEFAULT_CONFIG['thresholds']),
+        axis=1)) if '涨幅' in out else False
     if '换手' in out and out['换手'].median(skipna=True) < 1:
         out['换手'] = out['换手'] * 100
     if '封流比' not in out and {'封单额', '流通市值'} <= set(out.columns):
