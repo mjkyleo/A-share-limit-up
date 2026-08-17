@@ -68,6 +68,25 @@ except Exception:
     pass
 
 
+# =============================== 计算缓存（性能优化 P0+） ===============================
+# 回测的瓶颈在于：rolling_ic / rolling_score / rolling_net_curve / factor_correlation /
+# incremental_ic / make_advice 各自都在「遍历所有可回测日」时反复调用 backtest_one，
+# 导致 backtest_one 被重复计算 ~13×N 次。这里对 backtest_one 与聚合函数做进程内记忆化，
+# 同一 (db, 日期, 清单, 口径) 只算一次，下游聚合全部命中缓存。
+# 键使用 db.path（而非 id(db)）以规避对象回收后 id 复用导致的串库风险。
+_MEMO = {}
+
+
+def clear_backtest_cache():
+    """清空所有回测/指标缓存。每次用户发起一次完整回测前调用，避免配置变更后读到陈旧结果。"""
+    _MEMO.clear()
+    try:
+        from core import metrics
+        metrics._MEMO.clear()
+    except Exception:
+        pass
+
+
 def score_row(pct, rules):
     """实际涨幅(百分点) → 得分。rules=[[下限,得分]...] 升序，取满足条件的最后一档"""
     if pct is None or (isinstance(pct, float) and np.isnan(pct)):
@@ -116,17 +135,23 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None, caliber=None
     cfg = cfg or {}
     bcfg = cfg.get('backtest_cost', {})
     cal = caliber or bcfg.get('caliber', 'close')
+    _key = (db.path, target_date, list_type, cal)
+    if _key in _MEMO:
+        return _MEMO[_key]
     pred = db.get_predictions(target_date)
     pred = pred[pred['list_type'] == list_type]
     if pred.empty:
+        _MEMO[_key] = (None, None, None, None)
         return None, None, None, None
     actual = db.get_daily(target_date)
     if actual.empty:
+        _MEMO[_key] = (None, None, None, None)
         return None, None, None, None
     merge_cols = ['代码6', '涨幅', '今日涨停', '开盘涨幅', '封板分钟']
     actual_cols = [c for c in merge_cols if c in actual.columns]
     mg = pred.merge(actual[actual_cols], left_on='code', right_on='代码6', how='inner')
     if len(mg) < 3:
+        _MEMO[_key] = (None, None, None, None)
         return None, None, None, None
     mg = mg.sort_values('rank').reset_index(drop=True)
     mg = mg.rename(columns={'涨幅': '实际涨幅%', '今日涨停': '实际涨停'})
@@ -145,28 +170,21 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None, caliber=None
         mg['口径收益%'] = mg['实际涨幅%'].astype(float) / 100.0
         caliber_used = 'close(T日收盘→T+1收盘)' if cal != 'open' else 'close(降级:缺开盘涨幅)'
 
-    # ---- 双边成本% ----
-    mg['双边成本%'] = mg['代码6'].apply(
-        lambda c: round(metrics.per_trade_cost_pct(c, bcfg) * 100, 4))
+    # ---- 双边成本%（每行只算一次，后续组合/净值/曲线复用）----
+    cost = mg['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg))
+    mg['双边成本%'] = (cost * 100).round(4)
     mg['净收益%'] = (mg['口径收益%'] * 100 - mg['双边成本%']).round(3)
 
-    # ---- 无法成交：一字/秒板（涨停 且 封板分钟≤0.5；缺封板分钟则 M可买性<0.3）----
-    def _cant(r):
-        if not r['实际涨停']:
-            return False
-        fm = r.get('封板分钟')
-        if pd.notna(fm):
-            return float(fm) <= 0.5
-        mb = r.get('M可买性')
-        return (float(mb) < 0.3) if pd.notna(mb) else False
-
-    mg['无法成交'] = mg.apply(_cant, axis=1)
+    # ---- 无法成交（向量化）：涨停 且（封板分钟≤0.5 若有效，否则 M可买性<0.3）----
+    _is_up = mg['实际涨停'].astype(bool)
+    _fm = pd.to_numeric(mg.get('封板分钟'), errors='coerce')
+    _mb = pd.to_numeric(mg.get('M可买性'), errors='coerce')
+    mg['无法成交'] = _is_up & np.where(_fm.notna(), _fm <= 0.5, _mb < 0.3)
 
     # ---- 等权组合（仅可成交股）----
     trad = mg[~mg['无法成交']]
     if len(trad) > 0:
-        costs = trad['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg))
-        net_i = trad['口径收益%'] - costs
+        net_i = trad['口径收益%'] - cost[~mg['无法成交']]
         port_gross = float(trad['口径收益%'].mean())
         port_net = float(net_i.mean())
         win_rate = float((net_i > 0).mean())
@@ -176,16 +194,15 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None, caliber=None
         port_net = 0.0
         win_rate = 0.0
         rep_code = mg['代码6'].iloc[0] if len(mg) > 0 else '600000'
-    cost_pct = float(mg['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg)).mean())
+    cost_pct = float(cost.mean())
     cant_ratio = float(mg['无法成交'].mean())
 
     # ---- 基准：买全部涨停股（等权）----
     lim = mg[mg['实际涨停']]
     if len(lim) > 0:
         bench_gross = float(lim['口径收益%'].mean())
-        # 注意：上方已把 今日涨停 重命名为 实际涨停，benchmark_curve 期望 '今日涨停' 列
         bench_in = lim[['代码6', '口径收益%']].copy()
-        bench_in['今日涨停'] = lim['实际涨停'].values
+        bench_in['今日涨停'] = True
         bench = metrics.benchmark_curve(bench_in, bcfg)
         bench_net = bench['net_return']
         bench_code = lim['代码6'].iloc[0]
@@ -246,9 +263,9 @@ def backtest_one(db, target_date, list_type='涨停TopN', cfg=None, caliber=None
                                           pd.Series([rep_code]), bcfg),
     }
     # 组合净值(累计) 列（单日仅一点，便于明细展示）
-    mg['组合净值(累计)'] = round((1.0 + mg['口径收益%']
-                                  - mg['代码6'].apply(lambda c: metrics.per_trade_cost_pct(c, bcfg))).prod(), 4) \
+    mg['组合净值(累计)'] = round((1.0 + mg['口径收益%'] - cost).prod(), 4) \
         if len(mg) > 0 else np.nan
+    _MEMO[_key] = (mg, summary, ic, perf)
     return mg, summary, ic, perf
 
 
@@ -279,8 +296,12 @@ def _daily_ic_matrix(db, list_type='涨停TopN', cfg=None):
 
 def rolling_ic(db, list_type='涨停TopN', cfg=None):
     """全部可回测日期的策略 IC 汇总（均值 + CI95 + 样本n + 显著性）→ (DataFrame, 天数)"""
+    _key = ('ric', db.path, id(cfg), list_type)
+    if _key in _MEMO:
+        return _MEMO[_key]
     mat, used = _daily_ic_matrix(db, list_type, cfg)
     if mat.empty:
+        _MEMO[_key] = (pd.DataFrame(), 0)
         return pd.DataFrame(), 0
     sig = metrics.factor_significance(mat, alpha=0.05)
     pos = {c: int((mat[c] > 0).sum()) for c in mat.columns}
@@ -298,11 +319,16 @@ def rolling_ic(db, list_type='涨停TopN', cfg=None):
             '评价': '✅ 稳定有效' if r['均值IC'] > 0.3
             else ('⚠️ 不稳定' if r['均值IC'] > 0 else '❌ 建议下调权重'),
         })
-    return pd.DataFrame(rows).sort_values('平均IC', ascending=False).reset_index(drop=True), used
+    _res = (pd.DataFrame(rows).sort_values('平均IC', ascending=False).reset_index(drop=True), used)
+    _MEMO[_key] = _res
+    return _res
 
 
 def rolling_score(db, list_type, cfg=None):
     """清单滚动得分汇总 → (DataFrame, 天数)。列：日期/匹配数/平均得分/总得分/达成率"""
+    _key = ('rsc', db.path, id(cfg), list_type)
+    if _key in _MEMO:
+        return _MEMO[_key]
     rows = []
     for d in db.pending_backtest_dates():
         _, summary, _, _ = backtest_one(db, d, list_type, cfg)
@@ -312,9 +338,9 @@ def rolling_score(db, list_type, cfg=None):
                      '平均得分': float(summary['平均得分']),
                      '总得分': float(summary['总得分']),
                      '达成率': summary['达成率']})
-    if not rows:
-        return pd.DataFrame(), 0
-    return pd.DataFrame(rows), len(rows)
+    _res = (pd.DataFrame(rows), len(rows)) if rows else (pd.DataFrame(), 0)
+    _MEMO[_key] = _res
+    return _res
 
 
 # =============================== 动态权重（P0-5 shrinkage） ===============================

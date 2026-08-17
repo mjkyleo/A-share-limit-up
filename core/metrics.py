@@ -23,6 +23,15 @@ from scipy import stats
 from core import strategies
 
 
+# 进程内缓存（与 backtest._MEMO 同步清空）：factor_correlation / incremental_ic /
+# rolling_net_curve 各自遍历全部可回测日做回归/相关，记忆化后同一回测会话内只算一次。
+_MEMO = {}
+
+
+def clear_metrics_cache():
+    _MEMO.clear()
+
+
 # ----------------------------- 交易成本 -----------------------------
 def per_trade_cost_pct(code, bcfg: dict) -> float:
     """双边交易成本（小数）。公式 = 2*commission + stamp_tax + 2*slippage。
@@ -113,6 +122,9 @@ def rolling_net_curve(db, list_type: str = '涨停TopN', cfg: dict = None,
     cfg = cfg or {}
     bcfg = cfg.get('backtest_cost', {})
     cal = caliber or bcfg.get('caliber', 'close')
+    _key = ('rnc', db.path, id(cfg), list_type, cal)
+    if _key in _MEMO:
+        return _MEMO[_key]
     days = db.pending_backtest_dates()
     gross_port, code_port, gross_bench, code_bench = {}, {}, {}, {}
     for d in days:
@@ -125,16 +137,20 @@ def rolling_net_curve(db, list_type: str = '涨停TopN', cfg: dict = None,
         code_bench[d] = perf['bench_code']
     n_days = len(gross_port)
     if n_days == 0:
-        return {'sufficient': False, 'n_days': 0, 'caliber': cal,
+        _res = {'sufficient': False, 'n_days': 0, 'caliber': cal,
                 'portfolio': _empty_perf(), 'benchmark': _empty_perf(),
                 'note': '样本不足（无可回测日）'}
+        _MEMO[_key] = _res
+        return _res
     port = net_return_curve(pd.Series(gross_port), pd.Series(code_port), bcfg)
     bench = net_return_curve(pd.Series(gross_bench), pd.Series(code_bench), bcfg)
     sufficient = n_days >= 2
     note = (f'跨 {n_days} 个交易日等权净值（{cal} 口径，初始100万仅刻度）'
             if sufficient else '样本不足（需 ≥2 个交易日）无法计算 Sharpe/最大回撤')
-    return {'sufficient': sufficient, 'n_days': n_days, 'caliber': cal,
+    _res = {'sufficient': sufficient, 'n_days': n_days, 'caliber': cal,
             'portfolio': port, 'benchmark': bench, 'note': note}
+    _MEMO[_key] = _res
+    return _res
 
 
 def _empty_perf() -> dict:
@@ -208,6 +224,9 @@ def factor_correlation(db, cfg: dict = None, method: str = 'spearman') -> pd.Dat
 
     返回 5×5 DataFrame（index=columns=五策略键）。
     """
+    _key = ('corr', db.path, id(cfg), method)
+    if _key in _MEMO:
+        return _MEMO[_key]
     from core import backtest as bt
     factors = bt.V2_KEYS
     days = db.pending_backtest_dates()
@@ -222,9 +241,13 @@ def factor_correlation(db, cfg: dict = None, method: str = 'spearman') -> pd.Dat
         if df.shape[0] >= 5:
             mats.append(df.corr(method=method))
     if not mats:
-        return pd.DataFrame(index=factors, columns=factors, dtype='float64')
+        _res = pd.DataFrame(index=factors, columns=factors, dtype='float64')
+        _MEMO[_key] = _res
+        return _res
     out = sum(mats) / len(mats)
-    return out.round(3)
+    _res = out.round(3)
+    _MEMO[_key] = _res
+    return _res
 
 
 def incremental_ic(db, list_type: str = '涨停TopN', cfg: dict = None) -> pd.DataFrame:
@@ -234,6 +257,9 @@ def incremental_ic(db, list_type: str = '涨停TopN', cfg: dict = None) -> pd.Da
     再算 该因子 vs 残差 的 Spearman IC；跨日取均值。
     返回：因子|IC(原始)|增量IC|增量IC_p|独立增量贡献%
     """
+    _key = ('inc', db.path, id(cfg), list_type)
+    if _key in _MEMO:
+        return _MEMO[_key]
     from core import backtest as bt
     factors = bt.V2_KEYS
     raw, inc, inc_p = ({f: [] for f in factors} for _ in range(3))
@@ -271,4 +297,6 @@ def incremental_ic(db, list_type: str = '涨停TopN', cfg: dict = None) -> pd.Da
         contrib = abs(m_inc) / tot * 100.0 if (tot > 0 and not np.isnan(m_inc)) else 0.0
         rows.append({'因子': f, 'IC(原始)': round(m_raw, 3), '增量IC': round(m_inc, 3),
                      '增量IC_p': round(m_p, 4), '独立增量贡献%': round(contrib, 1)})
-    return pd.DataFrame(rows)
+    _res = pd.DataFrame(rows)
+    _MEMO[_key] = _res
+    return _res

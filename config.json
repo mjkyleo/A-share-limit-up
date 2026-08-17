@@ -181,7 +181,7 @@
   "dynamic_weights": {
     "enabled": true,
     "auto_kill_negative": true,
-    "auto_apply": false,
+    "auto_apply": true,
     "floor": 0.02,
     "min_days": 3,
     "ema_window": 10,

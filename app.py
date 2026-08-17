@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 ================================================================================
-涨停预测工具 v2.0  —— VSCode 打开本文件按 F5 直接运行
+涨停预测工具 v2.6  —— VSCode 打开本文件按 F5 直接运行
 ================================================================================
 依赖安装（一次性）:
     pip install PySide6 pandas numpy scipy openpyxl
@@ -92,34 +92,35 @@ class ExtContext:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('涨停预测工具 v2.0')
+        self.setWindowTitle('涨停预测工具 v2.6')
         self.resize(1280, 800)
         self.db = DB(BASE_DIR)
         self.cfg = strategies.load_config(BASE_DIR)
         cal.set_extra_holidays(self.cfg.get('extra_holidays', []))
         self.data = None          # 合并后的当日数据
         self.result = None        # 预测结果
+        self._busy = False        # 是否有后台计算在跑（防止重入）
 
         # ---------- 顶部状态栏 ----------
         top = QHBoxLayout()
         code, desc = cal.current_session()
         self.lbl_session = QLabel(f'📅 {datetime.now():%Y-%m-%d %A} | {desc}')
         self.lbl_session.setStyleSheet('font-weight:bold;padding:4px')
-        btn_scan = QPushButton('🔄 扫描数据文件夹')
-        btn_scan.clicked.connect(self.scan)
-        btn_predict = QPushButton('🚀 生成预测')
-        btn_predict.clicked.connect(self.predict)
-        btn_tail = QPushButton('🌆 尾盘选股')
-        btn_tail.clicked.connect(self.tail_select)
-        btn_backtest = QPushButton('📊 运行回测')
-        btn_backtest.clicked.connect(self.run_backtest)
-        for b in (btn_scan, btn_predict, btn_tail, btn_backtest):
+        self.btn_scan = QPushButton('🔄 扫描数据文件夹')
+        self.btn_scan.clicked.connect(self.scan)
+        self.btn_predict = QPushButton('🚀 生成预测')
+        self.btn_predict.clicked.connect(self.predict)
+        self.btn_tail = QPushButton('🌆 尾盘选股')
+        self.btn_tail.clicked.connect(self.tail_select)
+        self.btn_backtest = QPushButton('📊 运行回测')
+        self.btn_backtest.clicked.connect(self.run_backtest)
+        for b in (self.btn_scan, self.btn_predict, self.btn_tail, self.btn_backtest):
             b.setMinimumHeight(32)
         top.addWidget(self.lbl_session, 1)
-        top.addWidget(btn_scan)
-        top.addWidget(btn_predict)
-        top.addWidget(btn_tail)
-        top.addWidget(btn_backtest)
+        top.addWidget(self.btn_scan)
+        top.addWidget(self.btn_predict)
+        top.addWidget(self.btn_tail)
+        top.addWidget(self.btn_backtest)
 
         # ---------- 主区 Tabs ----------
         self.tabs = QTabWidget()
@@ -148,6 +149,12 @@ class MainWindow(QMainWindow):
         lay.addLayout(top)
         lay.addWidget(self.tabs)
         self.setCentralWidget(root)
+
+        # ---------- 底部状态栏（显示计算状态/进度） ----------
+        self._status = self.statusBar()
+        self._status.setStyleSheet('padding:3px')
+        self._status.showMessage('就绪')
+
         self.scan()               # 启动自动扫描
 
     # ================= Tabs =================
@@ -561,136 +568,205 @@ class MainWindow(QMainWindow):
             self.log('扫描出错:\n' + traceback.format_exc())
 
     def predict(self):
-        try:
-            data, infos = loader.load_dataset(DATA_DIR)
-            if data.empty:
+        """生成预测：后台线程执行（数据加载 + 五策略评分），UI 不卡死。"""
+        if self._busy:
+            return
+        self._set_busy(True)
+        dlg = QProgressDialog('正在生成预测…（数据加载 + 五策略评分）', None, 0, 0, self)
+        dlg.setWindowTitle('生成预测')
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.show()
+        self._predict_thread = PredictWorker(self.cfg, DATA_DIR)
+        self._predict_thread.progress.connect(dlg.setLabelText)
+        self._predict_thread.finished.connect(
+            lambda ok, p, err: self._on_predict_done(ok, p, err, dlg))
+        self._predict_thread.start()
+
+    def _on_predict_done(self, ok, payload, err, dlg):
+        dlg.close()
+        self._set_busy(False)
+        if not ok:
+            if err == '__NO_DATA__':
                 QMessageBox.warning(self, '无数据', '未找到可用数据文件')
-                return
-            self.data = data
-            self.result = strategies.run_prediction(data, self.cfg)
-            date_str = data['数据日期'].max()
-            target = cal.next_trading_day(datetime.strptime(date_str, '%Y%m%d').date())
+            else:
+                self.log('预测出错:\n' + err)
+                QMessageBox.critical(self, '错误', err[-500:])
+            return
+        result = payload['result']
+        date_str = payload['date_str']
+        target = payload['target']
+        cv_txt = payload['cv_txt']
+        self.data = payload['data']
+        self.result = result
 
-            cols = ['排名', '代码', '名称', '今日涨停', 'S1封单强度', 'S2封板质量',
-                    'S3锁仓度', 'S4资金', 'S5股性结构', 'M可买性', 'R风险系数',
-                    '预估涨停概率%', '综合分']
-            cols = [c for c in cols if c in data.columns or c in self.result['涨停TopN'].columns]
-            df_to_table(self.tbl_limit, self.result['涨停TopN'][cols], aliases=PROB_ALIASES)
-            r4cols = ['排名', '代码', '名称', '涨幅', '量比', '资金流向', '涨4评分', '预估涨4概率%']
-            df_to_table(self.tbl_rise4,
-                        self.result['涨幅4%'][[c for c in r4cols if c in self.result['涨幅4%'].columns]],
-                        aliases=PROB_ALIASES)
-            mcols = cols + ['连板潜力']
-            df_to_table(self.tbl_monday,
-                        self.result['连板候选'][[c for c in mcols if c in self.result['连板候选'].columns]],
-                        aliases=PROB_ALIASES)
-
-            cv = strategies.cross_validate(self.result['全量'])
-            cv_txt = ' | '.join(f'{k}: ρ={v[0]}' for k, v in cv.items()) if cv else '样本不足'
-            self.lbl_pred_info.setText(
-                f"数据日期 {date_str} → 预测目标日 {target:%Y-%m-%d} | "
-                f"涨停股 {int(data['今日涨停'].sum())} 只 | 交叉验证 {cv_txt} | {self.result['连板备注']}")
-            # 预测入库（供未来回测）
-            self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '涨停TopN',
-                                     self.result['涨停TopN'], '预估涨停概率%', '综合分')
-            self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '涨幅4%',
-                                     self.result['涨幅4%'], '预估涨4概率%', '涨4评分')
-            self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '连板候选',
-                                     self.result['连板候选'], '预估涨停概率%', '连板潜力')
-            self.log(f'预测完成：目标日 {target}，三张清单已入库（明日收盘数据导入后可回测）')
-            self.tabs.setCurrentWidget(self.tab_pred)
-        except Exception:
-            self.log('预测出错:\n' + traceback.format_exc())
-            QMessageBox.critical(self, '错误', traceback.format_exc()[-500:])
+        cols = ['排名', '代码', '名称', '今日涨停', 'S1封单强度', 'S2封板质量',
+                'S3锁仓度', 'S4资金', 'S5股性结构', 'M可买性', 'R风险系数',
+                '预估涨停概率%', '综合分']
+        cols = [c for c in cols if c in self.data.columns or c in result['涨停TopN'].columns]
+        df_to_table(self.tbl_limit, result['涨停TopN'][cols], aliases=PROB_ALIASES)
+        r4cols = ['排名', '代码', '名称', '涨幅', '量比', '资金流向', '涨4评分', '预估涨4概率%']
+        df_to_table(self.tbl_rise4,
+                    result['涨幅4%'][[c for c in r4cols if c in result['涨幅4%'].columns]],
+                    aliases=PROB_ALIASES)
+        mcols = cols + ['连板潜力']
+        df_to_table(self.tbl_monday,
+                    result['连板候选'][[c for c in mcols if c in result['连板候选'].columns]],
+                    aliases=PROB_ALIASES)
+        self.lbl_pred_info.setText(
+            f"数据日期 {date_str} → 预测目标日 {target:%Y-%m-%d} | "
+            f"涨停股 {int(self.data['今日涨停'].sum())} 只 | 交叉验证 {cv_txt} | {result['连板备注']}")
+        # 预测入库（供未来回测）
+        self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '涨停TopN',
+                                 result['涨停TopN'], '预估涨停概率%', '综合分')
+        self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '涨幅4%',
+                                 result['涨幅4%'], '预估涨4概率%', '涨4评分')
+        self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '连板候选',
+                                 result['连板候选'], '预估涨停概率%', '连板潜力')
+        self.log(f'预测完成：目标日 {target}，三张清单已入库（明日收盘数据导入后可回测）')
+        self.tabs.setCurrentWidget(self.tab_pred)
 
     def tail_select(self):
-        """尾盘选股：取最新日期的最新盘中批次快照 → 尾盘清单 → 入库待回测"""
-        try:
-            data, info = loader.load_latest_intraday(DATA_DIR)
-            if data.empty:
+        """尾盘选股：后台线程执行，UI 不卡死。"""
+        if self._busy:
+            return
+        self._set_busy(True)
+        dlg = QProgressDialog('正在尾盘选股…（定位最新盘中批次 + 评分）', None, 0, 0, self)
+        dlg.setWindowTitle('尾盘选股')
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.show()
+        self._tail_thread = TailWorker(self.cfg, DATA_DIR)
+        self._tail_thread.progress.connect(dlg.setLabelText)
+        self._tail_thread.finished.connect(
+            lambda ok, p, err: self._on_tail_done(ok, p, err, dlg))
+        self._tail_thread.start()
+
+    def _on_tail_done(self, ok, payload, err, dlg):
+        dlg.close()
+        self._set_busy(False)
+        if not ok:
+            if err == '__NO_DATA__':
                 QMessageBox.warning(
                     self, '无盘中数据',
                     '未找到盘中批次快照。\n\n命名格式：日期+批次号（当天第几次导出）\n'
                     '  08-14-01.xlsx  第1次导出（如 10:30）\n'
                     '  08-14-02.xlsx  第2次导出（如 14:30 尾盘）\n'
                     '自动取当天批次号最大的文件。')
-                return
-            res, note = strategies.run_tail_session(data, self.cfg)
-            if res.empty:
-                self.lbl_tail_info.setText(note)
-                self.tbl_tail.setRowCount(0)
-                return
-            date_str = data['数据日期'].max()
-            target = cal.next_trading_day(datetime.strptime(date_str, '%Y%m%d').date())
-            cols = ['排名', '代码', '名称', '类型', '涨幅', '量比', '换手', '封流比',
-                    '主力净量', '强势', '资金', '量能', '位置',
-                    '尾盘评分', 'M可买性', 'R风险系数', '预估次日溢价概率%']
-            df_to_table(self.tbl_tail, res[[c for c in cols if c in res.columns]],
-                        aliases=PROB_ALIASES)
-            _, desc = cal.current_session()
-            self.lbl_tail_info.setText(
-                f"📄 {info['文件']}（第{info.get('batch') or '?'}批，{len(data)}只）→ "
-                f"目标日 {target:%Y-%m-%d} | {note} | 当前时段：{desc}")
-            self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '尾盘选股',
-                                     res, '预估次日溢价概率%', '尾盘评分')
-            self._refresh_bt_dates()
-            self.log(f'尾盘选股完成：{info["文件"]} → {len(res)} 只，目标日 {target}，已入库待回测')
-            self.tabs.setCurrentWidget(self.tab_tail)
-        except Exception:
-            self.log('尾盘选股出错:\n' + traceback.format_exc())
-            QMessageBox.critical(self, '错误', traceback.format_exc()[-500:])
+            else:
+                self.log('尾盘选股出错:\n' + err)
+                QMessageBox.critical(self, '错误', err[-500:])
+            return
+        res = payload['res']
+        note = payload['note']
+        data = payload['data']
+        target = payload['target']
+        info = payload['info']
+        date_str = payload['date_str']
+        if res is None or res.empty:
+            self.lbl_tail_info.setText(note)
+            self.tbl_tail.setRowCount(0)
+            return
+        cols = ['排名', '代码', '名称', '类型', '涨幅', '量比', '换手', '封流比',
+                '主力净量', '强势', '资金', '量能', '位置',
+                '尾盘评分', 'M可买性', 'R风险系数', '预估次日溢价概率%']
+        df_to_table(self.tbl_tail, res[[c for c in cols if c in res.columns]],
+                    aliases=PROB_ALIASES)
+        _, desc = cal.current_session()
+        self.lbl_tail_info.setText(
+            f"📄 {info['文件']}（第{info.get('batch') or '?'}批，{len(data)}只）→ "
+            f"目标日 {target:%Y-%m-%d} | {note} | 当前时段：{desc}")
+        self.db.save_predictions(date_str, target.strftime('%Y%m%d'), '尾盘选股',
+                                 res, '预估次日溢价概率%', '尾盘评分')
+        self._refresh_bt_dates()
+        self.log(f'尾盘选股完成：{info["文件"]} → {len(res)} 只，目标日 {target}，已入库待回测')
+        self.tabs.setCurrentWidget(self.tab_tail)
 
     def run_backtest(self):
-        try:
-            d = self.cmb_bt_date.currentText()
-            if not d:
-                QMessageBox.information(self, '提示', '没有可回测的日期。\n回测需要：先有预测记录，再导入目标日收盘数据。')
-                return
-            lt = self.cmb_list.currentText()
-            caliber = 'open' if self.radio_open.isChecked() else 'close'
-            mg, summary, ic, perf = bt.backtest_one(self.db, d, lt, self.cfg, caliber=caliber)
-            if summary is None:
-                self.lbl_bt_summary.setText('该清单在此日匹配样本不足')
-                return
-            self.lbl_bt_summary.setText(' | '.join(f'{k}:{v}' for k, v in summary.items()))
-            if mg is not None:
-                detail_cols = [c for c in ['rank', 'code', 'name', 'prob', '实际涨幅%', '实际涨停',
-                                           '得分', '口径收益%', '净收益%', '双边成本%', '无法成交']
-                               if c in mg.columns]
-                df_to_table(self.tbl_bt_detail, mg[detail_cols])
-            if ic:
-                df_to_table(self.tbl_bt_ic, pd.DataFrame(ic).T.reset_index().rename(
-                    columns={'index': '策略'}))
-            roll, n_days = bt.rolling_ic(self.db, lt, self.cfg)
-            if not roll.empty:
-                df_to_table(self.tbl_bt_rolling, roll)
-            sc, _ = bt.rolling_score(self.db, lt, self.cfg)
-            if not sc.empty:
-                df_to_table(self.tbl_bt_score, sc)
-            # ---- 净值/绩效（P0-2/P0-3）----
-            curve = metrics.rolling_net_curve(self.db, lt, self.cfg, caliber=caliber)
-            self._render_perf(lt, caliber, perf, curve)
-            # ---- 因子相关性 + 增量IC（P0-6）----
-            self._render_factor_analysis()
-            advice, sug, plan = bt.make_advice(self.db, self.cfg)
-            self.txt_advice.setPlainText('\n'.join(advice))
-            self._suggested_weights = sug
-            if plan is not None:
-                df_to_table(self.tbl_dyn_w, plan)
+        """运行回测：后台线程 + 确定性进度条（0~100，可取消），UI 不卡死。"""
+        if self._busy:
+            return
+        d = self.cmb_bt_date.currentText()
+        if not d:
+            QMessageBox.information(self, '提示', '没有可回测的日期。\n回测需要：先有预测记录，再导入目标日收盘数据。')
+            return
+        lt = self.cmb_list.currentText()
+        caliber = 'open' if self.radio_open.isChecked() else 'close'
+        self._set_busy(True)
+        dlg = QProgressDialog(f'正在回测 {d} / {lt}（{caliber}）…', '取消', 0, 100, self)
+        dlg.setWindowTitle('回测进度')
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setValue(0)
+        dlg.show()
+        self._bt_thread = BacktestWorker(BASE_DIR, self.cfg, d, lt, caliber)
+        dlg.canceled.connect(self._bt_thread.request_cancel)
+        self._bt_thread.progress.connect(
+            lambda v, t: (dlg.setValue(v), dlg.setLabelText(t)))
+        self._bt_thread.finished.connect(
+            lambda ok, p, err: self._on_backtest_done(ok, p, err, dlg))
+        self._bt_thread.start()
+
+    def _on_backtest_done(self, ok, payload, err, dlg):
+        dlg.close()
+        self._set_busy(False)
+        if not ok:
+            if err == '__CANCEL__':
+                self.log('回测已取消')
             else:
-                self.tbl_dyn_w.setRowCount(0)
-            # 自动应用动态权重（不打断用户，仅记录日志）
-            if self.chk_auto_apply.isChecked() and sug:
-                self.cfg['weights'].update(sug)
-                strategies.save_config(BASE_DIR, self.cfg)
-                self._load_weights_table()
-                self.log(f'已自动应用动态权重：{sug}')
-            # ---- CSV 落盘（T10，受 backtest_cost.report_csv 控制）----
-            self._export_backtest_csv(d, lt, caliber, mg, summary, ic, perf, roll, n_days, curve)
-            self.log(f'回测完成：{d} / {lt}（{caliber}），累计可回测 {n_days} 天，调参建议已更新')
+                self.log('回测出错:\n' + err)
+                QMessageBox.critical(self, '错误', err[-500:])
+            return
+        d = payload['d']
+        lt = payload['lt']
+        caliber = payload['caliber']
+        mg = payload.get('mg')
+        summary = payload.get('summary')
+        ic = payload.get('ic')
+        perf = payload.get('perf')
+        roll = payload.get('roll')
+        n_days = payload.get('n_days')
+        sc = payload.get('sc')
+        curve = payload.get('curve')
+        if summary is None:
+            self.lbl_bt_summary.setText('该清单在此日匹配样本不足')
             self.tabs.setCurrentWidget(self.tab_bt)
-        except Exception:
-            self.log('回测出错:\n' + traceback.format_exc())
+            return
+        self.lbl_bt_summary.setText(' | '.join(f'{k}:{v}' for k, v in summary.items()))
+        if mg is not None:
+            detail_cols = [c for c in ['rank', 'code', 'name', 'prob', '实际涨幅%', '实际涨停',
+                                       '得分', '口径收益%', '净收益%', '双边成本%', '无法成交']
+                           if c in mg.columns]
+            df_to_table(self.tbl_bt_detail, mg[detail_cols])
+        if ic:
+            df_to_table(self.tbl_bt_ic, pd.DataFrame(ic).T.reset_index().rename(
+                columns={'index': '策略'}))
+        if roll is not None and not roll.empty:
+            df_to_table(self.tbl_bt_rolling, roll)
+        if sc is not None and not sc.empty:
+            df_to_table(self.tbl_bt_score, sc)
+        # ---- 净值/绩效（P0-2/P0-3）----
+        self._render_perf(lt, caliber, perf, curve)
+        # ---- 因子相关性 + 增量IC（P0-6）----
+        self._render_corr_table(payload.get('corr'))
+        if payload.get('inc') is not None:
+            df_to_table(self.tbl_bt_incic, payload.get('inc'))
+        advice = payload.get('advice')
+        sug = payload.get('sug')
+        plan = payload.get('plan')
+        self.txt_advice.setPlainText('\n'.join(advice) if advice else '')
+        self._suggested_weights = sug
+        if plan is not None:
+            df_to_table(self.tbl_dyn_w, plan)
+        else:
+            self.tbl_dyn_w.setRowCount(0)
+        # 自动应用动态权重（不打断用户，仅记录日志）
+        if self.chk_auto_apply.isChecked() and sug:
+            self.cfg['weights'].update(sug)
+            strategies.save_config(BASE_DIR, self.cfg)
+            self._load_weights_table()
+            self.log(f'已自动应用动态权重：{sug}')
+        # ---- CSV 落盘（T10，受 backtest_cost.report_csv 控制）----
+        self._export_backtest_csv(d, lt, caliber, mg, summary, ic, perf, roll, n_days, curve)
+        self.log(f'回测完成：{d} / {lt}（{caliber}），累计可回测 {n_days} 天，调参建议已更新')
+        self.tabs.setCurrentWidget(self.tab_bt)
 
     def _render_perf(self, list_type, caliber, perf, curve):
         """渲染净值/绩效 Tab（P0-2/P0-3）：净组合收益/Sharpe/最大回撤/胜率/基准对照/无法成交/双边成本。"""
@@ -721,13 +797,6 @@ class MainWindow(QMainWindow):
         else:
             rows.append(('跨日净值', (curve or {}).get('note', '样本不足（需 ≥2 个交易日）')))
         df_to_table(self.tbl_bt_perf, pd.DataFrame(rows, columns=['指标', '数值']))
-
-    def _render_factor_analysis(self):
-        """渲染因子相关性(彩色热力图) + 增量IC 两个 Tab（P0-6）。"""
-        corr = metrics.factor_correlation(self.db, self.cfg, method='spearman')
-        self._render_corr_table(corr)
-        inc = metrics.incremental_ic(self.db, '涨停TopN', self.cfg)
-        df_to_table(self.tbl_bt_incic, inc)
 
     def _render_corr_table(self, corr: pd.DataFrame):
         """因子相关性彩色热力图：正相关红(共线风险)/负相关蓝(对冲)/接近0白。"""
@@ -942,3 +1011,125 @@ class TrainWorker(QThread):
             self.finished.emit(ok, msg)
         except Exception:
             self.finished.emit(False, '训练异常:\n' + traceback.format_exc()[-500:])
+
+
+# ---------------------------------------------------------------------------
+# 后台计算线程（预测 / 尾盘选股 / 回测）—— 模块级，避免打断 MainWindow 类体
+# 计算在子线程执行，主线程只负责 UI 渲染，从而不卡死并支持进度指示。
+# 回测线程内自建 DB 连接（SQLite 连接不可跨线程复用），记忆化缓存以 db.path 为键共享。
+# ---------------------------------------------------------------------------
+class _CancelRun(Exception):
+    """回测被用户取消时由 worker 抛出。"""
+    pass
+
+
+class PredictWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(bool, object, str)   # (ok, payload, error_msg)
+
+    def __init__(self, cfg, data_dir):
+        super().__init__()
+        self.cfg = cfg
+        self.data_dir = data_dir
+
+    def run(self):
+        try:
+            self.progress.emit('正在扫描并加载数据…')
+            data, _infos = loader.load_dataset(self.data_dir)
+            if data.empty:
+                self.finished.emit(False, None, '__NO_DATA__')
+                return
+            self.progress.emit('正在计算五策略评分…')
+            result = strategies.run_prediction(data, self.cfg)
+            date_str = data['数据日期'].max()
+            target = cal.next_trading_day(datetime.strptime(date_str, '%Y%m%d').date())
+            cv = strategies.cross_validate(result['全量'])
+            cv_txt = ' | '.join(f'{k}: ρ={v[0]}' for k, v in cv.items()) if cv else '样本不足'
+            payload = {'result': result, 'data': data, 'date_str': date_str,
+                       'target': target, 'cv_txt': cv_txt}
+            self.finished.emit(True, payload, '')
+        except Exception:
+            self.finished.emit(False, None, traceback.format_exc())
+
+
+class TailWorker(QThread):
+    progress = Signal(str)
+    finished = Signal(bool, object, str)
+
+    def __init__(self, cfg, data_dir):
+        super().__init__()
+        self.cfg = cfg
+        self.data_dir = data_dir
+
+    def run(self):
+        try:
+            self.progress.emit('正在定位最新盘中批次…')
+            data, info = loader.load_latest_intraday(self.data_dir)
+            if data.empty:
+                self.finished.emit(False, None, '__NO_DATA__')
+                return
+            self.progress.emit('正在尾盘选股评分…')
+            res, note = strategies.run_tail_session(data, self.cfg)
+            date_str = data['数据日期'].max()
+            target = cal.next_trading_day(datetime.strptime(date_str, '%Y%m%d').date())
+            payload = {'res': res, 'note': note, 'data': data, 'target': target,
+                       'info': info, 'date_str': date_str}
+            self.finished.emit(True, payload, '')
+        except Exception:
+            self.finished.emit(False, None, traceback.format_exc())
+
+
+class BacktestWorker(QThread):
+    progress = Signal(int, str)            # (percent 0~100, label)
+    finished = Signal(bool, object, str)  # (ok, payload, error_msg)
+
+    def __init__(self, base_dir, cfg, d, lt, caliber):
+        super().__init__()
+        self.base_dir = base_dir
+        self.cfg = cfg
+        self.d = d
+        self.lt = lt
+        self.caliber = caliber
+        self._cancel = False
+
+    def request_cancel(self):
+        self._cancel = True
+
+    def _chk(self, pct, msg):
+        """推进进度；若用户已取消则中断。"""
+        self.progress.emit(pct, msg)
+        if self._cancel:
+            raise _CancelRun
+
+    def run(self):
+        payload = {'d': self.d, 'lt': self.lt, 'caliber': self.caliber}
+        try:
+            bt.clear_backtest_cache()      # 每次回测前清空记忆化缓存，避免配置变更读到陈旧结果
+            db = DB(self.base_dir)         # 子线程自建连接（SQLite 连接不可跨线程）
+            self._chk(5, f'回测 {self.d} / {self.lt}（{self.caliber}）…')
+            mg, summary, ic, perf = bt.backtest_one(db, self.d, self.lt, self.cfg, caliber=self.caliber)
+            if summary is None:
+                payload['summary'] = None
+                self.finished.emit(True, payload, '')
+                return
+            self._chk(20, '计算滚动 IC…')
+            roll, n_days = bt.rolling_ic(db, self.lt, self.cfg)
+            self._chk(35, '计算清单得分滚动…')
+            sc, _ = bt.rolling_score(db, self.lt, self.cfg)
+            self._chk(50, '计算跨日净值曲线…')
+            curve = metrics.rolling_net_curve(db, self.lt, self.cfg, caliber=self.caliber)
+            self._chk(65, '计算因子相关性…')
+            corr = metrics.factor_correlation(db, self.cfg, method='spearman')
+            self._chk(80, '计算增量 IC…')
+            inc = metrics.incremental_ic(db, '涨停TopN', self.cfg)
+            self._chk(95, '生成调参建议…')
+            advice, sug, plan = bt.make_advice(db, self.cfg)
+            self._chk(100, '完成')
+            payload.update({'mg': mg, 'summary': summary, 'ic': ic, 'perf': perf,
+                            'roll': roll, 'n_days': n_days, 'sc': sc, 'curve': curve,
+                            'corr': corr, 'inc': inc, 'advice': advice, 'sug': sug, 'plan': plan})
+            self.finished.emit(True, payload, '')
+        except _CancelRun:
+            self.finished.emit(False, None, '__CANCEL__')
+        except Exception:
+            self.finished.emit(False, None, traceback.format_exc())
