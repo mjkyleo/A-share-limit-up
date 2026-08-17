@@ -157,6 +157,23 @@ class MainWindow(QMainWindow):
 
         self.scan()               # 启动自动扫描
 
+    # ================= 计算状态切换（按钮防重入 + 状态栏） =================
+    def _set_busy(self, busy, text=''):
+        """统一切换后台计算状态：置标志、禁用/启用动作按钮、更新状态栏。
+
+        busy=True 时禁用四个动作按钮防止重入，状态栏显示计算提示；
+        busy=False 时恢复按钮并复位为「就绪」。
+        """
+        self._busy = busy
+        for b in (self.btn_scan, self.btn_predict, self.btn_tail, self.btn_backtest):
+            b.setEnabled(not busy)
+        if text:
+            self._status.showMessage(text)
+        elif busy:
+            self._status.showMessage('正在计算，请稍候…')
+        else:
+            self._status.showMessage('就绪')
+
     # ================= Tabs =================
     def _build_files_tab(self):
         w = QWidget()
