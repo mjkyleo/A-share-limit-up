@@ -1,0 +1,264 @@
+{
+  "weights": {
+    "S1封单强度": 0.4,
+    "S2封板质量": 0.25,
+    "S3锁仓度": 0.15,
+    "S4资金": 0.05,
+    "S5股性结构": 0.15
+  },
+  "base_limit_up": 0.15,
+  "base_rush": 0.04,
+  "base_rise4": 0.1,
+  "thresholds": {
+    "涨停判定涨幅": 9.5,
+    "封流比_强": 3.0,
+    "封流比_极强": 5.0,
+    "封成比_强": 3.0,
+    "封成比_极强": 10.0,
+    "锁仓换手_极紧": 3.0,
+    "锁仓换手_紧": 8.0,
+    "锁仓换手_松": 15.0,
+    "小市值上限": 80,
+    "高位20日涨幅": 60.0,
+    "开板次数_风险": 3
+  },
+  "top_n": 20,
+  "rise4_n": 20,
+  "monday_n": 8,
+  "tail_n": 20,
+  "tail_weights": {
+    "强势": 0.35,
+    "资金": 0.25,
+    "量能": 0.2,
+    "位置": 0.2
+  },
+  "scoring": {
+    "涨停TopN": [
+      [
+        -99,
+        -80
+      ],
+      [
+        -6,
+        -50
+      ],
+      [
+        -4,
+        -30
+      ],
+      [
+        -2,
+        -10
+      ],
+      [
+        0,
+        20
+      ],
+      [
+        2,
+        40
+      ],
+      [
+        4,
+        60
+      ],
+      [
+        6,
+        75
+      ],
+      [
+        9.5,
+        100
+      ]
+    ],
+    "涨幅4%": [
+      [
+        -99,
+        -60
+      ],
+      [
+        -6,
+        -40
+      ],
+      [
+        -4,
+        -25
+      ],
+      [
+        -2,
+        -10
+      ],
+      [
+        0,
+        15
+      ],
+      [
+        2,
+        40
+      ],
+      [
+        4,
+        100
+      ]
+    ],
+    "连板候选": [
+      [
+        -99,
+        -100
+      ],
+      [
+        -6,
+        -70
+      ],
+      [
+        -4,
+        -45
+      ],
+      [
+        -2,
+        -20
+      ],
+      [
+        0,
+        20
+      ],
+      [
+        4,
+        50
+      ],
+      [
+        9.5,
+        100
+      ]
+    ],
+    "尾盘选股": [
+      [
+        -99,
+        -60
+      ],
+      [
+        -4,
+        -35
+      ],
+      [
+        -2,
+        -15
+      ],
+      [
+        0,
+        30
+      ],
+      [
+        2,
+        60
+      ],
+      [
+        4,
+        80
+      ],
+      [
+        9.5,
+        100
+      ]
+    ]
+  },
+  "extra_holidays": [],
+  "dynamic_weights": {
+    "enabled": true,
+    "auto_kill_negative": true,
+    "auto_apply": false,
+    "floor": 0.02,
+    "min_days": 3
+  },
+  "extensions": {
+    "bottom_fishing": {
+      "enabled": true,
+      "datasource": "local",
+      "params": {
+        "min_drop": 7.0,
+        "max_drop": 9.5,
+        "min_20d_change": 0.0,
+        "min_5d_change": -99.0,
+        "require_support": true,
+        "exclude_consecutive_down": false,
+        "consecutive_days": 3,
+        "bottom_n": 20
+      }
+    },
+    "market_regime": {
+      "enabled": true,
+      "datasource": "akshare",
+      "params": {
+        "ma_window": 20,
+        "vol_window": 20,
+        "risk_on_up_ratio": 0.55,
+        "risk_off_up_ratio": 0.45,
+        "panic_drop_5d": -3.0
+      }
+    },
+    "short_reversal": {
+      "enabled": true,
+      "datasource": "akshare",
+      "params": {
+        "min_drop": 3.0,
+        "max_drop": 7.0,
+        "min_amp": 3.0,
+        "min_shadow_ratio": 0.25,
+        "min_turnover": 1.0,
+        "max_turnover": 20.0,
+        "min_lb": 1.0,
+        "min_60d_change": -20.0,
+        "max_cap": 300.0,
+        "exclude_st": true,
+        "top_n": 20
+      }
+    },
+    "defensive": {
+      "enabled": true,
+      "datasource": "akshare",
+      "params": {
+        "max_amp": 4.0,
+        "max_turnover": 5.0,
+        "min_60d_change": -5.0,
+        "max_60d_change": 15.0,
+        "max_pb": 3.0,
+        "min_pe": 0.0,
+        "max_pe": 30.0,
+        "min_cap": 100.0,
+        "max_cap": 2000.0,
+        "exclude_st": true,
+        "top_n": 20
+      }
+    },
+    "neural_predict": {
+      "enabled": true,
+      "datasource": "akshare",
+      "params": {
+        "universe_source": "hs300",
+        "lookback_days": 250,
+        "max_universe": 150,
+        "min_hist": 60,
+        "backend": "sklearn",
+        "hidden": "64,32",
+        "epochs": 300,
+        "auto_train": true,
+        "fetch_missing": false,
+        "max_predict_calls": 50,
+        "top_n": 30
+      }
+    },
+    "topdown_pick": {
+      "enabled": true,
+      "datasource": "local",
+      "params": {
+        "top_n_sectors": 5,
+        "min_sector_count": 3,
+        "timing_method": "auto",
+        "weight_sector": 40,
+        "weight_leader": 60,
+        "gate_non_main": 70,
+        "top_n": 30
+      }
+    }
+  }
+}

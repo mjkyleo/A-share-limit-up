@@ -1,0 +1,6 @@
+PySide6>=6.5
+pandas
+numpy
+scipy
+openpyxl
+akshare>=1.18
