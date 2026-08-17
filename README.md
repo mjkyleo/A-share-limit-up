@@ -192,7 +192,10 @@ pip install -r requirements.txt
 ├── test_topdown.py     # 自上而下方法论引擎离线回归测试（可选，不联网）
 ├── test_metrics.py     # 指标库单元测试（成本/净值/相关性/增量IC，可选）
 ├── test_limitup.py     # 统一涨停判定单元测试（主板/20cm/30cm，可选）
-├── analyze_combined.py # 四股联合分析脚本（自上而下×五因子×基本面，输出 reports/）
+├── docs/               # 文档与第三方接口参考
+│   └── akshare-api-reference.md  # AKShare 股票数据接口参考（第三方，约 1MB）
+├── scripts/            # 一次性 / 分析脚本（非运行时依赖）
+│   └── analyze_combined.py  # 四股联合分析脚本（自上而下×五因子×基本面，输出 reports/）
 ├── core/               # 解耦的核心模块
 │   ├── loader.py       # 文件扫描/格式识别/批次识别/字段清洗（表头顺序无关）
 │   ├── strategies.py   # 五策略引擎 + 涨4%预测器 + 尾盘选股器 + 统一涨停判定 is_limit_up/board_of（参数全在 DEFAULT_CONFIG）

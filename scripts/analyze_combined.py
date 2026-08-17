@@ -12,7 +12,8 @@
 联合得分 = 0.55·基本面评分 + 0.45·项目综合分(归一化)  —— 在「非主线逆向篮子」内排序。
 """
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 本脚本位于 scripts/ 子目录，需把项目根目录加入 sys.path 才能 import core
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from core.loader import read_any, clean
